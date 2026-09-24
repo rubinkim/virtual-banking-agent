@@ -1177,4 +1177,268 @@ print("통과: owner_id가 user-001로 강제 교체됨")
 
 ---
 
+---
+
+## 대화 11 — 독립 GitHub 저장소 만들기 (선생님 저장소 push 금지)
+
+**일시: 2026-09-24**
+
+### 상황 파악
+
+`aim-ai-agent-rubin` 상위 폴더의 git remote를 확인하니 본인 저장소가 아니었음.
+
+- `origin` = `https://github.com/jun-yu-edu/aim-ai-agent.git` (선생님/교육기관 저장소. 본인 계정 `rubinkim`이 아님)
+- 로컬 `main`은 `origin/main`보다 165커밋 뒤처져 있었고, `mini-project-3`는 상위 저장소에 untracked 상태였음.
+
+### 결정
+
+- **선생님 저장소로는 어떤 경우에도 push하지 않는다.** (사용자의 명시적 규칙. Claude의 메모리에도 저장됨)
+- 본인 GitHub에 새 저장소를 만들어 제출한다.
+- **방법 A 선택: `mini-project-3`만 독립된 git 저장소로 만든다.** (방법 B는 상위 저장소의 `origin`을 바꾸는 것인데, 과제와 무관한 파일이 대량으로 섞이고 잘못된 곳에 push할 위험이 남아 제외)
+- 저장소 이름: **`virtual-banking-agent`** ("가상 금융 업무 AI Agent"의 영문 표현 후보 중 `Virtual Banking Assistant` 계열이 프로젝트 성격(은행 앱 기능을 자연어로 처리)에 가장 잘 맞아 선택)
+- 원격 URL: `https://github.com/rubinkim/virtual-banking-agent.git` (빈 저장소로 생성: README, .gitignore, license 모두 체크 해제)
+
+### 진행 내용
+
+1. **점검**: `mini-project-3`에는 자체 `.git`이 없었고 `.gitignore`도 없었음. 프로젝트 안에 `.env`는 없었고(상위 폴더에만 존재), 키처럼 보이는 문자열(`AIza`, `api_key`, `secret`, `token` 등) 검색 결과도 없었음.
+2. **`.gitignore` 작성**: `__pycache__/`, `*.py[oc]`, `build/`, `dist/`, `*.egg-info/`, `.venv`, `.env`, `.env.*`, `.ipynb_checkpoints/`, `.vscode/`, OS 파일.
+3. **독립 저장소 초기화**: `git init -b main` → `git remote add origin <본인 저장소 URL>`. `git rev-parse --show-toplevel`이 `mini-project-3`를 가리키는 것으로 상위 저장소와 분리됐음을 확인.
+4. **스테이징 21개 파일 검토**: `.venv`, `__pycache__`, `.env`가 없고 소스·데이터·문서·`uv.lock`만 포함. (CRLF 경고는 Windows 줄바꿈 변환 안내라 무시)
+5. **`data/data.json` 포함 여부**: 실행 중 값이 바뀌는 작업용 복사본이라 이체 기능을 만들면 커밋 이력이 지저분해질 수 있으나, **일단 포함**하고 이체 기능을 만들 때 다시 판단하기로 함.
+6. **첫 커밋 & push** (push 직전에 remote가 본인 저장소인지 다시 확인):
+   - 커밋 `b1aa353` "잔액 조회 workflow 구현: account subgraph, supervisor 라우팅, owner_id 강제 교체 노드"
+   - `git push -u origin main` 성공, `main`이 `origin/main`을 추적.
+
+### 주의사항
+
+- 상위 폴더(`aim-ai-agent-rubin`)는 여전히 선생님 `origin`과 연결되어 있으므로 **거기서는 커밋·push를 하지 않는다.** 모든 작업은 `mini-project-3` 안에서 한다.
+- 상위 폴더의 `git status`에는 `mini-project-3`가 중첩 저장소로 보일 수 있음.
+
+---
+
+## 대화 12 — 거래내역 조회 workflow 설계 (tool 명세 확정)
+
+**일시: 2026-09-24** (구현 전, 설계만 확정한 세션)
+
+### 1. 큰 구조: 잔액 조회와 동일
+
+내가 제안한 방향("supervisor가 요청을 account 쪽으로 넘기면 거래내역 도구로 `data.json`의 `transactions`에서 필요한 데이터를 가져와 보여준다")이 맞음. 그래프의 노드·엣지는 거의 바뀌지 않고 **tool 하나를 추가**하는 것이며, 바뀌는 것은 `bind_tools`/`ToolNode`의 tool 목록과 system 프롬프트뿐. `account_enforce_owner`는 모든 tool 호출의 `owner_id`를 교체하므로 새 tool이 `owner_id`를 받는 한 수정 없이 자동 적용됨.
+
+### 2. `data.json`의 구조 (실제 파일에서 확인)
+
+| 컬렉션 | 건수 | 필드 |
+|---|---|---|
+| `accounts` | 5 | `account_id`, `owner_id`, `nickname`, `balance` |
+| `cards` | 4 | `card_id`, `owner_id`, `name`, `account_id`, `status`, `card_number`, `card_type` |
+| `transactions` | 20 | `transaction_id`, `owner_id`, `account_id`, `type`, `amount`, `occurred_at`, `card_id`, `merchant` |
+| `addresses` | 2 | `address_id`, `owner_id`, `label`, `address` |
+| `bills` | 5 | `bill_id`, `owner_id`, `name`, `amount`, `due_date`, `status` |
+| `requests` | 0 | (비어 있음, 구조는 직접 설계) |
+| `reissue_applications` | 0 | (비어 있음, 구조는 직접 설계) |
+
+### 3. join 가능성 분석
+
+| join | 연결 컬럼 | 관계 | 비고 |
+|---|---|---|---|
+| `transactions` ↔ `accounts` | `account_id` | 거래 N : 계좌 1 | 항상 연결됨. 별명 조회용 |
+| `transactions` ↔ `cards` | `card_id` | 거래 N : 카드 1 | **left join 필수**: 20건 중 8건이 `card_id`가 null, 나머지는 `card-001`, `card-002` |
+| `cards` ↔ `accounts` | `account_id` | 카드 N : 계좌 1 | 카드가 어느 계좌에서 결제되는지 |
+| `bills` ↔ `accounts` | 직접 연결 없음 | - | `owner_id`로만 이어짐. 납부 계좌는 납부 시점에 사용자가 지정 |
+| `addresses` ↔ `cards` | 직접 연결 없음 | - | 재발급 신청 때 `reissue_applications`에서 연결될 예정 |
+
+`bills`, `addresses`를 `owner_id`로 억지로 join하면 행이 곱절로 복제되므로 **거래내역용 view에서 제외**.
+
+**view 후보**
+- ① `transaction_view` (거래내역 조회용, 핵심): `transactions` + `accounts`(별명) + `cards`(카드 이름·종류, left join). 컬럼: `transaction_id, owner_id, account_id, account_nickname, type, amount, occurred_at, merchant, card_id, card_name, card_type`. `accounts.balance`는 **현재** 잔액이라 거래 시점 잔액으로 오해할 수 있어 제외.
+- ② `card_view` (카드 조회용): `cards` + `accounts`(연결 계좌 별명·잔액)
+
+### 4. "모든 CSV를 join한 종합 테이블" 아이디어에 대한 평가
+
+내가 이전에 만든 CSV들을 전부 join해서 하나의 종합 table로 쓰자는 생각에 대해:
+
+- **날짜 계산은 Python이 하는 게 맞음**: "오늘", "이번 달", "이번 주"를 결정론적으로 계산하는 건 `datetime`이 확실함.
+- **전부 join하면 안 됨**: 위 3번대로 `bills`/`addresses`는 거래와 ID로 이어지지 않아 행이 복제됨. 필요한 표만 join.
+- **CSV를 런타임 조회 저장소로 쓰면 안 됨**: CSV는 `data.json`에서 파생된 사본이라 이체 기능으로 `data.json`이 바뀌면 곧바로 낡은 데이터가 됨. **원본은 `data.json` 하나**로 두고, tool이 호출될 때마다 `data.json`을 읽어 **메모리에서 join한 DataFrame**을 만든다(20건 규모라 비용 무시 가능, 동기화 문제 없음). CSV는 데이터를 눈으로 확인하는 탐색용으로만 유지.
+- join한 뒤 **가장 먼저 `owner_id`로 필터링**해야 남의 거래가 결과에 섞이지 않음.
+
+### 5. 카드↔계좌 관계에 대한 오해 정정 (내가 짚은 것과 Claude가 과장했던 것)
+
+Claude가 "카드와 계좌가 항상 같지는 않다"는 식으로 문제처럼 말했으나, 나는 "`card-001`은 `acc-001`(생활비), `card-002`는 `acc-003`(여행)으로 1:1 대응하는 자연스러운 구조인데 뭐가 문제냐"고 반문했고, **실제 데이터로 검증한 결과 문제 없음**이 확인됨.
+
+- 카드 거래 중 카드의 연결 계좌와 거래 계좌가 다른 건: **0건**. 데이터는 완전히 일관됨.
+- Claude가 실제로 말하려던 것은 짝의 불일치가 아니라 **"출금"과 "카드 결제"의 범위가 다르다**는 점이었음.
+
+`acc-001`(생활비 계좌) 12건의 구성:
+
+| 구분 | 건수 |
+|---|---|
+| 입금 (`card_id` 없음) | 2 |
+| 출금, `card-001`로 결제 | 9 |
+| 출금, 카드 없이 (이체 등) | 1 |
+
+- "생활비 **계좌** 출금 내역" → 카드 결제 9건 + 카드 없는 출금 1건 = **10건**
+- "생활비 **카드**로 결제한 내역" → **9건**만
+
+PDF 정의("결제"는 카드를 사용해 지출한 거래)와 맞물려, tool에 `account_id` 필터와 별개로 **카드 결제만 보는 옵션**이 필요.
+
+### 6. "LLM이 view를 보고 `account_id`를 알아낸다"에 대한 정정
+
+내 아이디어는 "별명과 `owner_id`가 주어지면 LLM이 view를 보고 `account_id`를 알아낼 수 있지 않을까"였음. 정정: **LLM은 view를 볼 수 없음.** view는 tool 함수 안에서 파이썬이 메모리에 만드는 것이라 LLM에게 보이는 건 tool이 반환한 결과 문자열뿐. `account_id`를 알아내려면 계좌 목록이 tool 결과로 LLM에게 전달되어야 함.
+
+**별명 → `account_id` 방법 비교**
+
+1. **잔액 조회 tool을 먼저 호출하는 2단계 방식 (선택)**: 이미 `get_account_balance_by_owner`가 `account_id`와 `nickname`을 함께 반환하므로, LLM이 그 결과에서 "생활비 = acc-001"을 찾아 거래내역 tool에 넘김. 새로 만들 게 없고, **띄어쓰기가 달라도("여행자금" vs "여행 자금") LLM이 유연하게 매칭**함(이전 테스트에서 확인). 단점은 LLM 호출이 한 번 늘어남. LLM이 `account_id`를 잘못 골라도 거래내역 tool이 `owner_id`로 소유권을 검증하므로 안전.
+2. 거래내역 tool이 별명을 직접 받기: 호출은 한 번이지만 파이썬 문자열 비교라 띄어쓰기만 달라도 못 찾음.
+3. 매 턴 system 프롬프트에 계좌 목록을 미리 넣기: 빠르지만 별명 변경 기능을 만들면 낡은 정보가 들어갈 위험.
+
+### 7. "view에 query하는 tool을 LLM에 바인딩" 아이디어 — (가) 정해진 파라미터 방식으로 결정
+
+내가 제안한 "view를 만들고 그 view에서 query를 할 수 있는 tool을 LLM에 바인딩"은 사실 **지금 설계와 거의 같음**. 차이는 LLM이 조건을 전달하는 방식뿐:
+
+- **(가) 정해진 파라미터로 조건 전달 (선택)**: LLM은 `period`, `min_amount` 같은 값만 채우고 필터링·정렬은 tool 안의 파이썬이 수행.
+- **(나) LLM이 SQL/pandas 쿼리를 직접 작성**: view를 `owner_id`로 미리 걸러 읽기 전용으로 실행하면 유출 위험은 줄지만…
+
+**(가)를 택한 이유**
+1. (나)는 오류가 조용히 틀림: "5만 원 이상"을 `>`로 쓰면 정확히 50,000원인 거래가 에러 없이 빠짐. 파라미터 방식은 "이상 = `>=`"를 코드에 한 번 고정.
+2. 날짜 해석을 파이썬이 하기로 한 결정과 충돌(자유 쿼리에서는 LLM이 "이번 주(월~일)"를 직접 계산).
+3. LLM이 만든 문자열을 `eval`/SQL로 실행하는 것은 프롬프트 인젝션 통로가 될 수 있음.
+4. 과제 README의 "실패 상황의 동작 확인"에 쓰기 위해, 정해진 파라미터가 "이 입력이면 이 결과"를 테스트로 고정하기 쉬움.
+
+LLM에게 view의 **구조**(컬럼 이름·의미)를 알려주는 것은 tool의 docstring으로 함. 자유로운 분석 질문("가맹점별로 얼마 썼어?")은 나중에 (나)를 **추가 기능**으로 검토.
+
+### 8. tool 파라미터 (내가 정한 조건 + 정리)
+
+내가 생각한 필터: **기간, 계좌, 금액, 유형, 카드 결제 여부** (PDF 스펙 "기간·금액·유형으로 조회, 카드 결제는 카드 표시"와 일치).
+
+| 조건 | 파라미터 | 메모 |
+|---|---|---|
+| 기간 | `period` 또는 `start_date`, `end_date` | 날짜는 둘 다 **포함**, 미지정이면 전체 (PDF 스펙) |
+| 계좌 | `account_id` | 없으면 소유자의 모든 계좌 |
+| 금액 | `min_amount`, `max_amount` | "5만 원 이상"은 `min_amount=50000` |
+| 유형 | `type` | `"deposit"`/`"withdrawal"` 두 값만 허용 (`Literal`) |
+| 카드 결제 여부 | `card_only` (bool) | "출금 전체"와 "카드 결제"가 다르므로 필요 |
+
+- 전부 선택(optional)이며 `None`이면 그 조건은 필터링하지 않음.
+- 카드가 계좌와 1:1이라 `card_id` 대신 `card_only`로 충분(나중에 "특정 카드" 필요 시 추가).
+
+**`type`의 철자 주의**: 데이터의 실제 값은 `deposit`(입금)과 **`withdrawal`**(출금)임. 내가 `withdrawl`로 썼는데, 철자가 다르면 `Literal`이나 필터 비교에서 **에러 없이 항상 0건**이 나오는 조용한 버그가 되므로 데이터 값을 그대로 복사해 쓴다. 결과에는 원본 값을 그대로 돌려주면 LLM이 사용자에게 "입금/출금"으로 풀어서 말함.
+
+### 9. 기간 처리: (B) Python이 계산 — `period` 키워드 세트 확정
+
+두 방식 중 **(B) tool이 `period` 키워드를 받고 Python이 실제 날짜를 계산**하는 방식을 선택. ((A) LLM이 기준일을 알고 날짜를 직접 계산하는 방식은 LLM이 오늘 날짜를 모르고 계산도 틀릴 수 있어 제외)
+
+| 키워드 | 범위 | 근거 |
+|---|---|---|
+| `this_month` | 기준일이 속한 달의 1일 ~ 말일 | PDF에 정의됨 |
+| `this_week` | 기준일이 속한 주의 월요일 ~ 일요일 | PDF에 정의됨 |
+| `last_month` | 지난달 1일 ~ 말일 | "이번 달"의 자연스러운 짝 |
+| `last_week` | 지난주 월 ~ 일 | 마찬가지 |
+| `today` | 기준일 하루 | 짧은 질문에 흔함 |
+
+- `period`를 비우면(`None`) 전체 기간 (스펙: 미지정 시 전체).
+- `Literal[...]`로 선언해 LLM이 허용 밖의 값을 넣을 수 없게 함.
+- 특정 날짜 범위("8월 15일부터 20일까지")는 `start_date`/`end_date`로 따로 받음. `period`와 날짜가 동시에 오면 **오류로 처리**.
+- "최근 일주일/30일"은 "이번 주"와 뜻이 다르고 스펙에 정의가 없어 **일단 제외**.
+- **기준일은 코드 한 곳(`get_base_date()` 같은 함수)에서만 정의**해, 테스트 때 이 함수만 특정 날짜(예: 2026-09-24)로 고정하면 "이번 주는 9/21~9/27"처럼 결과를 정확히 검증할 수 있음. 초기 데이터가 2026년 8~9월이라 `this_month`(9월)와 `last_month`(8월) 모두 실제 거래가 걸려 테스트하기 좋음.
+
+### 10. 반환 형식: 건수·합계는 Python이 계산
+
+LLM의 암산은 신뢰할 수 없으므로(잔액 합산 때와 같은 원칙) **건수와 합계는 Python이 계산해서 같이 반환**하기로 결정.
+
+- **합계는 유형별로 분리**: 데이터에서 입금·출금 모두 `amount`가 양수로 기록되므로, 전체를 그냥 더하면 입금과 출금이 섞여 의미 없는 숫자가 됨(예: 입금 1,000,000 + 출금 52,000 = 1,052,000). `total_deposit`, `total_withdrawal`로 나눔. 순증감은 필요해지면 추가.
+- `count`, 합계는 **목록이 아니라 필터 결과 전체를 기준**으로 계산(나중에 목록을 일부만 돌려주도록 바꿔도 합계가 어긋나지 않게).
+- **0건이면 적용된 조건도 같이 반환**하기로 결정. 다만 0건일 때만이 아니라 **항상 같은 모양**으로 `applied_filters`를 포함(LLM이 해석하기 쉽고 코드 분기도 줄어듦).
+- 특히 **`period`가 실제 날짜로 풀려서**(`this_week` → `2026-09-21`~`2026-09-27`) 반환되는 것이 중요: LLM이 "이번 주"를 어떤 날짜로 해석했는지 사용자에게 보여줄 수 있고, 테스트에서 날짜 계산의 정확성도 바로 확인됨.
+
+```
+{
+  "count": 0,
+  "total_deposit": 0,
+  "total_withdrawal": 0,
+  "applied_filters": {
+    "account_id": "acc-001",
+    "start_date": "2026-09-21",
+    "end_date": "2026-09-27",
+    "min_amount": 50000,
+    "max_amount": null,
+    "type": "withdrawal",
+    "card_only": false
+  },
+  "transactions": []
+}
+```
+
+### 11. 오류 처리: 잘못된 조건은 오류 메시지 반환
+
+**"조건은 정상인데 결과가 0건"**과 **"조건 자체가 잘못됨"**은 다른 상황이라, 후자는 위 모양이 아니라 **`{"error": "..."}`만 담은 별도 응답**으로 반환. 그래야 LLM이 "내역이 없다"고 잘못 안내하지 않고 조건을 다시 확인하도록 사용자에게 되물을 수 있음.
+
+| 조건 | 오류 메시지 예 |
+|---|---|
+| `period`와 `start_date`/`end_date`를 동시에 줌 | 둘 중 하나만 지정해 주세요 |
+| 시작일 > 종료일 | 기간을 다시 확인해 주세요 |
+| 날짜 형식이 `YYYY-MM-DD`가 아님 | 날짜 형식을 확인해 주세요 |
+| `min_amount` > `max_amount` | 금액 범위를 다시 확인해 주세요 |
+| 금액이 음수 | 금액은 0 이상이어야 합니다 |
+| 조회할 수 없는 `account_id` | 조회할 수 없는 계좌입니다 |
+
+**원칙**
+1. 메시지는 LLM이 다음 행동을 정할 수 있게 "무엇이 잘못됐고 어떻게 고쳐야 하는지"를 적는다.
+2. **소유권 오류 메시지는 뭉뚱그린다.** 존재하지 않는 계좌와 남의 계좌를 똑같이 "조회할 수 없는 계좌입니다"로 응답해 다른 사람의 계좌 존재 여부를 알려주지 않음(잔액 조회 때의 "찾을 수 없음"과 같은 원칙).
+
+이 오류 케이스들이 그대로 **README에 적을 "직접 선정한 실패 상황의 동작 확인" 후보**가 됨.
+
+### 12. 최종 확정 명세: `get_account_transactions_by_owner`
+
+tool 이름은 잔액 조회 tool(`get_account_balance_by_owner`)과 짝을 이루게 확정.
+
+```python
+@tool(parse_docstring=True)
+def get_account_transactions_by_owner(
+    owner_id: str,
+    account_id: str | None = None,
+    period: Literal["this_month", "last_month", "this_week", "last_week", "today"] | None = None,
+    start_date: str | None = None,        # YYYY-MM-DD, 포함
+    end_date: str | None = None,          # YYYY-MM-DD, 포함
+    min_amount: int | None = None,
+    max_amount: int | None = None,
+    type: Literal["deposit", "withdrawal"] | None = None,
+    card_only: bool = False,
+) -> str:
+```
+
+(`type`은 파이썬 내장 이름을 가리므로 `transaction_type`처럼 바꿔도 됨.)
+
+**함수 안의 처리 순서**
+1. 입력 검증 → 잘못되면 `{"error": "..."}` 반환
+2. `period`를 Python이 실제 `start_date`/`end_date`로 변환 (기준일은 한 곳에서 정의)
+3. `data.json`에서 `transactions` + `accounts`(별명) + `cards`(이름, left join)를 메모리에서 join
+4. **`owner_id`로 먼저 필터링**
+5. 계좌, 기간, 금액, 유형, 카드 결제 여부로 필터링 (기간은 `occurred_at`의 날짜 부분으로 비교)
+6. 최근순 정렬
+7. `count`, `total_deposit`, `total_withdrawal`을 계산하고 `applied_filters`와 함께 JSON 문자열로 반환
+
+**같이 손볼 곳**
+- `bind_tools`와 `ToolNode`의 tool 목록에 추가
+- system 프롬프트: "`account_id`를 모르면 먼저 잔액 조회 tool로 계좌 목록을 확인하라", "기간 표현은 `period` 키워드로 매핑하라"
+- `account_enforce_owner`는 수정 불필요 (새 tool도 `owner_id`를 받으므로 자동 적용)
+
+### 이번 논의에서 배운 점
+
+1. **LLM은 tool이 반환한 결과 문자열만 볼 수 있다.** "view를 본다"는 표현은 그 내용이 tool 결과로 전달될 때에만 성립한다.
+2. **원본 데이터는 하나(`data.json`)로 두고 파생 표(CSV, view)는 필요할 때 메모리에서 만든다.** 파생물을 저장소로 쓰면 원본이 바뀔 때 낡은 데이터가 생긴다.
+3. **계산·필터·정렬·날짜 해석처럼 결과가 정확해야 하는 일은 LLM이 아니라 tool 안의 Python이 한다.** "5만 원 이상"의 `>=` 같은 세부 조건이 코드에 한 번 고정되기 때문.
+4. **입력 스키마(`Literal`, 선택 파라미터)와 오류 응답을 설계하면 tool 자체가 안전장치가 된다.** 오류 메시지는 LLM이 다음 행동을 정할 수 있게, 소유권 관련은 존재 여부를 노출하지 않게 쓴다.
+5. **조용한 버그를 경계한다.** 값 철자(`withdrawal`)나 비교 연산자 하나가 에러 없이 결과만 틀리게 만든다. 데이터의 실제 값을 확인해서 그대로 쓴다.
+6. **내 지적으로 Claude의 과장이 정정됐다.** 카드↔계좌 1:1 대응을 문제로 본 설명에 반문했고, 실제 데이터 검증으로 "출금 vs 카드 결제의 범위 차이"라는 정확한 논점이 드러났다. 설명을 그대로 받아들이지 않고 데이터로 확인하는 태도가 유효했다.
+
+### 다음 할 일
+
+- `get_account_transactions_by_owner`를 `functions.py`에 구현 (기준일 함수 `get_base_date()`, `period` → 날짜 변환, 입력 검증, join, 필터, 정렬, 합계 계산).
+- `graph.py`의 `bind_tools`, `ToolNode`, system 프롬프트 갱신.
+- **노드 단독 테스트가 아니라 tool 함수 단독 테스트**를 먼저 작성(LLM 없이, 기준일 고정): 기간 계산(`this_week` = 9/21~9/27 등), 필터 경계값(정확히 50,000원), 카드 결제 9건 vs 출금 10건, 소유권 오류, 잘못된 조건 오류.
+- `main.py`에서 "이번 달 생활비 출금 내역 보여줘", "5만 원 이상 결제한 내역 찾아줘" 같은 실제 요청으로 전체 실행 테스트.
+- 이전 과제 유지: 프롬프트 보강 후 내부 식별자(`user-001`) 노출이 사라졌는지 재확인, "잔액 합산" Python tool 구현 여부 결정.
+
+---
+
 *(이 문서는 대화가 진행되는 대로 계속 갱신 가능합니다. 다음 논의도 이어서 추가해주세요.)*
