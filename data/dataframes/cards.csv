@@ -1,0 +1,5 @@
+﻿card_id,owner_id,name,account_id,status,card_number,card_type
+card-001,user-001,생활비 카드,acc-001,active,0000-0000-0000-0001,debit
+card-002,user-001,여행 카드,acc-003,active,0000-0000-0000-0002,debit
+card-003,user-002,생활비 카드,acc-004,active,0000-0000-0000-0003,debit
+card-004,user-003,생활비 카드,acc-005,active,0000-0000-0000-0004,debit

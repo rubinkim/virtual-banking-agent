@@ -1,0 +1,25 @@
+[project]
+name = "mini-project-3"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "rubinkim", email = "kimyongha2011@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "google-genai>=2.24.0",
+    "langchain>=1.4.2",
+    "langchain-google-genai>=4.4.0",
+    "langgraph>=1.2.12",
+    "langsmith>=0.14.0",
+    "pandas>=3.0.6",
+    "python-dotenv>=1.2.3",
+]
+
+[project.scripts]
+mini-project-3 = "mini_project_3:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"

@@ -1,0 +1,6 @@
+﻿bill_id,owner_id,name,amount,due_date,status
+bill-001,user-001,통신비,55000,2026-09-22,unpaid
+bill-002,user-001,전기요금,42000,2026-09-25,unpaid
+bill-003,user-001,수도요금,18000,2026-09-27,unpaid
+bill-004,user-001,관리비,130000,2026-09-30,unpaid
+bill-005,user-001,가스요금,25000,2026-09-18,unpaid
