@@ -3,14 +3,17 @@
 # 필요한 함수를 에이전트가 호출할 Tool로 제공합니다.
 
 import calendar
+import copy
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
 import pandas as pd
 from langchain_core.tools import tool
 
-DATA_PATH = 'data/data.json'
+from data_store import load_data
+
+KST = timezone(timedelta(hours=9))
 BASE_DATE = date(2026, 9, 20)
 
 
@@ -26,10 +29,7 @@ def get_account_balance_by_owner(owner_id: str, account_id: str | None = None) -
         owner_id: 계좌 소유주의 아이디
         account_id: 조회할 계좌 번호. 생략하면 (None) 해당 owner_id의 모든 계좌를 조회한다.
     """
-    file_path = 'data/data.json'
-
-    with open(file_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    data = load_data()
 
     matched = [
         account for account in data['accounts']
@@ -122,8 +122,7 @@ def get_account_transactions_by_owner(
     if min_amount is not None and max_amount is not None and min_amount > max_amount:
         return json.dumps({'error': f'최소 금액({min_amount})이 최대 금액({max_amount})보다 큽니다. 금액 범위를 다시 확인해 주세요.'}, ensure_ascii=False)
 
-    with open(DATA_PATH, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    data = load_data()
 
     if account_id is not None:
         owned = {a['account_id'] for a in data['accounts'] if a['owner_id'] == owner_id}
@@ -170,3 +169,87 @@ def get_account_transactions_by_owner(
         },
         'transactions': rows,
     }, ensure_ascii=False)
+
+
+def get_owner_accounts(data: dict, owner_id: str) -> list[dict]:
+    return [a for a in data['accounts'] if a['owner_id'] == owner_id]
+
+
+def get_transfer_time() -> datetime:
+    return datetime.combine(get_base_date(), datetime.now(KST).time().replace(microsecond=0), tzinfo=KST)
+
+
+def validate_transfer(data: dict, owner_id: str, from_account: str, to_account: str, amount: int) -> str | None:
+    """이체할 수 없으면 그 이유를, 가능하면 None을 반환한다."""
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+        return '이체 금액은 0보다 큰 원 단위 정수여야 합니다.'
+
+    mine = {a['account_id']: a for a in get_owner_accounts(data, owner_id)}
+    if from_account not in mine or to_account not in mine:
+        return '이체할 수 없는 계좌가 포함되어 있습니다. 본인 소유의 계좌 사이에서만 이체할 수 있습니다.'
+    if from_account == to_account:
+        return '출금 계좌와 입금 계좌가 같습니다. 서로 다른 계좌를 지정해 주세요.'
+
+    source = mine[from_account]
+    if source['balance'] < amount:
+        return f"{source['nickname']} 계좌의 잔액({source['balance']:,}원)이 이체 금액({amount:,}원)보다 적어 이체할 수 없습니다."
+    return None
+
+
+def build_transfer_preview(data: dict, owner_id: str, from_account: str, to_account: str, amount: int) -> dict:
+    mine = {a['account_id']: a for a in get_owner_accounts(data, owner_id)}
+    source, target = mine[from_account], mine[to_account]
+    return {
+        'from': {
+            'account_id': from_account,
+            'nickname': source['nickname'],
+            'balance_before': source['balance'],
+            'balance_after': source['balance'] - amount,
+        },
+        'to': {
+            'account_id': to_account,
+            'nickname': target['nickname'],
+            'balance_before': target['balance'],
+            'balance_after': target['balance'] + amount,
+        },
+        'amount': amount,
+    }
+
+
+def apply_transfer(data: dict, owner_id: str, from_account: str, to_account: str,
+                   amount: int, occurred_at: datetime) -> tuple[dict, dict]:
+    """원본을 바꾸지 않고, 잔액·거래 2건·처리 기록이 모두 반영된 새 데이터를 반환한다."""
+    new_data = copy.deepcopy(data)
+    accounts = {a['account_id']: a for a in new_data['accounts']}
+    accounts[from_account]['balance'] -= amount
+    accounts[to_account]['balance'] += amount
+
+    last_number = max((int(t['transaction_id'].split('-')[1]) for t in new_data['transactions']), default=0)
+    request_id = f"req-{len(new_data['requests']) + 1:03d}"
+    stamp = occurred_at.isoformat(timespec='seconds')
+
+    for offset, (account_id, kind) in enumerate([(from_account, 'withdrawal'), (to_account, 'deposit')], start=1):
+        new_data['transactions'].append({
+            'transaction_id': f'tx-{last_number + offset:03d}',
+            'owner_id': owner_id,
+            'account_id': account_id,
+            'type': kind,
+            'amount': amount,
+            'occurred_at': stamp,
+            'card_id': None,
+            'merchant': None,
+            'request_id': request_id,
+        })
+
+    record = {
+        'request_id': request_id,
+        'type': 'transfer',
+        'owner_id': owner_id,
+        'from_account': from_account,
+        'to_account': to_account,
+        'amount': amount,
+        'status': 'completed',
+        'created_at': stamp,
+    }
+    new_data['requests'].append(record)
+    return new_data, record
