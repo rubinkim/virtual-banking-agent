@@ -15,13 +15,15 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import InMemorySaver
 
-from functions import get_account_balance_by_owner
+from functions import get_account_balance_by_owner, get_account_transactions_by_owner
 
 load_dotenv()
 GEMINI_MODEL = os.getenv('GEMINI_MODEL')
 
+account_tools = [get_account_balance_by_owner, get_account_transactions_by_owner]
+
 llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL)
-llm_with_tools = llm.bind_tools([get_account_balance_by_owner])
+llm_with_tools = llm.bind_tools(account_tools)
 
 
 class BankState(TypedDict):
@@ -68,6 +70,9 @@ def account_call_model(state: BankState) -> BankState:
             f"account_id를 모르면 생략하고 호출해 전체 계좌를 조회한 뒤, 그 결과(nickname 포함)를 보고 답변을 구성하세요. "
             f"사용자가 특정 계좌를 지목하지 않았다면 조회된 계좌 전부를 나열해서 답하세요. "
             f"사용자가 지목한 이름과 일치하는 계좌가 2개 이상이면, 실행하지 말고 어떤 계좌인지 사용자에게 되물으세요. "
+            f"거래내역을 조회할 때 특정 계좌(별명)가 지정되었다면, account_id를 모르는 경우 먼저 잔액 조회 tool로 계좌 목록을 확인해 account_id를 알아낸 뒤 거래내역 tool을 호출하세요. "
+            f"기간 표현(이번 달, 지난주 등)은 날짜를 직접 계산하지 말고 period 키워드로 전달하세요. "
+            f"'결제'는 카드를 사용해 지출한 거래만을 뜻하므로 card_only=True로 조회하고, '출금'은 카드 결제와 계좌 출금을 모두 포함하니 구분해서 안내하세요. "
             f"아직 지원하지 않는 기능에 대한 요청이면, 추측해서 답하지 말고 현재 처리할 수 없다고 안내하세요."
         )
     )
@@ -88,7 +93,7 @@ def account_enforce_owner(state: BankState) -> BankState:
 
 account_builder = StateGraph(BankState)
 account_builder.add_node("account_call_model", account_call_model)
-account_builder.add_node("tools", ToolNode([get_account_balance_by_owner]))
+account_builder.add_node("tools", ToolNode(account_tools))
 account_builder.add_node("account_enforce_owner", account_enforce_owner)
 
 account_builder.add_edge(START, "account_call_model")
