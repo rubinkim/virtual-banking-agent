@@ -57,7 +57,7 @@ class BankState(TypedDict):
 
 
 class RouterDecision(BaseModel):
-    next: Literal["account_agent", "transfer_agent"]
+    next: Literal["account_agent", "transfer_agent", "unsupported"]
 
 router_llm = llm.with_structured_output(RouterDecision)
 
@@ -70,9 +70,12 @@ def supervisor(state: BankState) -> BankState:
         content=(
             "당신은 은행 업무 요청을 분석해서 적절한 담당 agent로 routing하는 supervisor 입니다. "
             "담당 agent는 두 가지입니다. "
-            "account_agent: 계좌 목록·잔액 조회, 거래내역 조회. "
+            "account_agent: 계좌 목록·잔액 조회, 거래내역 조회(카드로 결제한 거래내역·카드 사용 내역 조회도 여기에 포함). "
             "transfer_agent: 사용자 본인의 계좌 사이의 이체. 이체 정보(출금 계좌, 입금 계좌, 금액)를 되물은 직후 사용자가 그에 답하는 경우도 transfer_agent입니다. "
-            "그 밖의 요청도 가장 가까운 agent의 이름을 그대로 반환하세요. "
+            "unsupported: 위 두 agent가 처리하지 못하는 요청(카드 자체의 정지·잠금·재발급·목록·상태 조회, 청구서 조회·납부, 계좌 별명 변경, 일상 대화 등). "
+            "단, 카드로 결제한 '거래내역'을 묻는 것은 unsupported가 아니라 account_agent입니다. "
+            "억지로 가장 가까운 agent에 보내지 말고, 처리할 수 없는 요청이면 unsupported를 반환하세요. "
+            "해당하는 agent의 이름을 그대로 반환하세요. "
         )        
     )
     decision = router_llm.invoke([system, *messages])
@@ -381,17 +384,31 @@ def build_transfer_graph(extract=transfer_extract, classifier=classify_response)
 transfer_graph = build_transfer_graph()
 
 
+UNSUPPORTED_TEXT = (
+    '죄송합니다. 해당 요청은 아직 지원하지 않습니다. '
+    '현재는 계좌·잔액 조회, 거래내역 조회, 내 계좌 간 이체만 도와드릴 수 있습니다.'
+)
+
+
+def unsupported_reply(state: BankState) -> BankState:
+    """지원하지 않는 요청에 정해진 문장으로 안내하는 노드"""
+    return {'messages': [AIMessage(content=UNSUPPORTED_TEXT)]}
+
+
 parent_builder = StateGraph(BankState)
 parent_builder.add_node("supervisor", supervisor)
 parent_builder.add_node("account_agent", account_graph)
 parent_builder.add_node("transfer_agent", transfer_graph)
+parent_builder.add_node("unsupported", unsupported_reply)
 
 parent_builder.add_edge(START, "supervisor")
 parent_builder.add_conditional_edges(
-    "supervisor", route_from_supervisor, {"account_agent": "account_agent", "transfer_agent": "transfer_agent"}
+    "supervisor", route_from_supervisor,
+    {"account_agent": "account_agent", "transfer_agent": "transfer_agent", "unsupported": "unsupported"},
 )
 parent_builder.add_edge("account_agent", END)
 parent_builder.add_edge("transfer_agent", END)
+parent_builder.add_edge("unsupported", END)
 
 checkpoint_serde = JsonPlusSerializer(
     allowed_msgpack_modules=[(TransferAccounts.__module__, TransferAccounts.__name__)]
