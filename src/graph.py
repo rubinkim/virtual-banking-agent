@@ -10,7 +10,7 @@ from typing import Annotated, TypedDict, Literal
 from pydantic import BaseModel, Field, ValidationError
 
 from langgraph.graph.message import add_messages
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -51,6 +51,9 @@ class BankState(TypedDict):
     owner_id: str
     next: str
     transfer: TransferAccounts | None
+    transfer_response: str | None
+    transfer_decision: str | None
+    transfer_notice: str | None
 
 
 class RouterDecision(BaseModel):
@@ -140,6 +143,14 @@ transfer_extract_llm = llm.with_structured_output(TransferDraft)
 
 TRANSFER_FIELD_LABELS = {'from_account': '출금 계좌', 'to_account': '입금 계좌', 'amount': '이체 금액'}
 
+TRANSFER_RESET = {'transfer': None, 'transfer_response': None, 'transfer_decision': None, 'transfer_notice': None}
+TRANSFER_CANCEL_TEXT = '이체를 취소했습니다. 잔액과 거래내역은 변경되지 않았습니다.'
+
+
+def transfer_end(text: str) -> BankState:
+    """이체 흐름을 끝내는 공통 처리: 안내 메시지를 남기고 이체 관련 State를 전부 비운다"""
+    return {'messages': [AIMessage(content=text)], **TRANSFER_RESET}
+
 
 def transfer_extract(state: BankState) -> BankState:
     """대화에서 이체 정보(출금 계좌, 입금 계좌, 금액)를 뽑아 State.transfer를 채우는 노드"""
@@ -163,14 +174,13 @@ def transfer_extract(state: BankState) -> BankState:
     if missing:
         names = ', '.join(a['nickname'] for a in accounts)
         text = f"이체를 진행하려면 {', '.join(missing)} 정보가 더 필요합니다. (보유 계좌: {names}) 다시 말씀해 주세요."
-        return {'messages': [AIMessage(content=text)], 'transfer': None}
+        return transfer_end(text)
 
     try:
         transfer = TransferAccounts(from_account=draft.from_account, to_account=draft.to_account, amount=draft.amount)
     except ValidationError:
-        text = '이체 금액은 0보다 큰 원 단위 정수여야 합니다. 금액을 다시 말씀해 주세요.'
-        return {'messages': [AIMessage(content=text)], 'transfer': None}
-    return {'transfer': transfer}
+        return transfer_end('이체 금액은 0보다 큰 원 단위 정수여야 합니다. 금액을 다시 말씀해 주세요.')
+    return {**TRANSFER_RESET, 'transfer': transfer}
 
 
 def transfer_validate(state: BankState) -> BankState:
@@ -179,31 +189,138 @@ def transfer_validate(state: BankState) -> BankState:
     transfer = state['transfer']
     reason = validate_transfer(load_data(), state['owner_id'], transfer.from_account, transfer.to_account, transfer.amount)
     if reason:
-        return {'messages': [AIMessage(content=f'이체를 진행할 수 없습니다. {reason}')], 'transfer': None}
+        return transfer_end(f'이체를 진행할 수 없습니다. {reason}')
     return {}
 
 
 def transfer_approve(state: BankState) -> BankState:
-    """변경 내용을 보여주고 interrupt로 승인·거절을 받는 노드. 거절하면 변경 없이 State.transfer를 비운다"""
+    """이체안 전체를 보여주고 interrupt로 사용자의 응답 원문을 받아 State에 저장하는 노드"""
 
     transfer = state['transfer']
     preview = build_transfer_preview(load_data(), state['owner_id'], transfer.from_account, transfer.to_account, transfer.amount)
     source, target = preview['from'], preview['to']
+    notice = state.get('transfer_notice')
     message = (
-        '다음 이체를 진행할까요?\n'
+        (f'{notice}\n\n' if notice else '')
+        + '다음 이체를 진행할까요?\n'
         f"- 출금: {source['nickname']}({source['account_id']}) {source['balance_before']:,}원 → {source['balance_after']:,}원\n"
         f"- 입금: {target['nickname']}({target['account_id']}) {target['balance_before']:,}원 → {target['balance_after']:,}원\n"
         f"- 이체 금액: {preview['amount']:,}원"
     )
-    decision = interrupt({'message': message, 'preview': preview})
+    response = interrupt({'message': message, 'preview': preview})
 
-    if decision == 'approve':
-        return {}
-    return {'messages': [AIMessage(content='이체를 취소했습니다. 잔액과 거래내역은 변경되지 않았습니다.')], 'transfer': None}
+    return {'transfer_response': response, 'transfer_notice': None, 'transfer_decision': None}
+
+
+class ResponseInterpretation(BaseModel):
+    action: Literal['approve', 'reject', 'edit', 'unclear'] = Field(
+        description="approve: 이체안을 그대로 진행하는 데 분명히 동의 / reject: 이체하지 않겠다 / edit: 이체안의 일부를 바꾸겠다 / unclear: 분명하지 않음"
+    )
+    from_account: str | None = Field(default=None, description="바꾸려는 출금 계좌의 account_id. 바꾸지 않으면 null")
+    to_account: str | None = Field(default=None, description="바꾸려는 입금 계좌의 account_id. 바꾸지 않으면 null")
+    amount: int | None = Field(default=None, description="바꾸려는 이체 금액(원 단위 정수). 바꾸지 않으면 null")
+
+
+transfer_interpret_llm = llm.with_structured_output(ResponseInterpretation)
+
+FAST_APPROVE_WORDS = {'승인'}
+FAST_REJECT_WORDS = {'거절'}
+TRANSFER_EDIT_FIELDS = ('from_account', 'to_account', 'amount')
+TRANSFER_UNCLEAR_NOTICE = "응답을 이해하지 못했습니다. '승인' 또는 '거절'이라고 하시거나, 바꾸고 싶은 내용을 말씀해 주세요."
+
+
+def classify_response(state: BankState) -> ResponseInterpretation:
+    """승인 화면에 대한 사용자의 자연어 응답을 LLM으로 분류한다"""
+
+    transfer = state['transfer']
+    accounts = get_owner_accounts(load_data(), state['owner_id'])
+    nickname = {a['account_id']: a['nickname'] for a in accounts}
+    account_lines = '\n'.join(f"- {a['account_id']}: {a['nickname']}" for a in accounts)
+    plan = (
+        f"- 출금 계좌: {nickname.get(transfer.from_account, '알 수 없음')}({transfer.from_account})\n"
+        f"- 입금 계좌: {nickname.get(transfer.to_account, '알 수 없음')}({transfer.to_account})\n"
+        f"- 이체 금액: {transfer.amount:,}원"
+    )
+    system = SystemMessage(
+        content=(
+            "당신은 은행 이체 승인 화면에 대한 사용자의 응답을 분류합니다. "
+            f"현재 이체안:\n{plan}\n사용자의 계좌 목록:\n{account_lines}\n"
+            "approve는 사용자가 이 이체안을 그대로 진행하는 데 분명하게 동의할 때만 선택하세요. "
+            "이체안을 바꾸겠다는 말이 조금이라도 섞여 있으면(예: '5만 원으로 하고 진행해') approve가 아니라 edit입니다. "
+            "reject는 이체를 하지 않겠다는 뜻입니다. edit는 출금 계좌, 입금 계좌, 금액 중 하나 이상을 바꾸겠다는 뜻입니다. "
+            "동의인지 거절인지 수정인지 분명하지 않으면 반드시 unclear를 선택하세요. "
+            "edit일 때는 사용자가 바꾼 값만 채우고 나머지는 null로 두세요. "
+            "별명은 계좌 목록에서 account_id로 바꾸고, 금액은 원 단위 정수로 바꾸세요(예: 5만 원은 50000). "
+            "사용자가 account_id를 직접 말했다면 목록에 없더라도 그대로 반환하세요."
+        )
+    )
+    return transfer_interpret_llm.invoke([system, HumanMessage(content=state['transfer_response'])])
+
+
+def make_transfer_interpret(classifier=classify_response):
+    """사용자의 응답을 승인·거절·수정·불명확으로 해석하는 노드를 만든다. LLM 분류 뒤의 규칙은 전부 코드가 지킨다"""
+
+    def retry(decision: str, notice: str, transfer=None) -> BankState:
+        update = {'transfer_response': None, 'transfer_decision': decision, 'transfer_notice': notice}
+        if transfer is not None:
+            update['transfer'] = transfer
+        return update
+
+    def transfer_interpret(state: BankState) -> BankState:
+        response = (state.get('transfer_response') or '').strip()
+        transfer = state['transfer']
+
+        if response in FAST_APPROVE_WORDS:
+            return {'transfer_response': None, 'transfer_decision': 'approve'}
+        if response in FAST_REJECT_WORDS:
+            return transfer_end(TRANSFER_CANCEL_TEXT)
+
+        try:
+            result = classifier(state)
+        except Exception:
+            result = None
+        if result is None:
+            return retry('unclear', TRANSFER_UNCLEAR_NOTICE)
+
+        changes = {key: getattr(result, key) for key in TRANSFER_EDIT_FIELDS if getattr(result, key) is not None}
+        action = result.action
+        if action == 'approve' and changes:
+            action = 'edit'
+
+        if action == 'approve':
+            return {'transfer_response': None, 'transfer_decision': 'approve'}
+        if action == 'reject':
+            return transfer_end(TRANSFER_CANCEL_TEXT)
+        if action != 'edit':
+            return retry('unclear', TRANSFER_UNCLEAR_NOTICE)
+
+        current = transfer.model_dump(exclude={'date'})
+        if not changes:
+            return retry('unclear', '수정할 내용을 파악하지 못했습니다. 바꾸고 싶은 계좌나 금액을 다시 말씀해 주세요.')
+        if {**current, **changes} == current:
+            return retry('unclear', '말씀하신 내용은 현재 이체안과 같습니다. 바꾸고 싶은 내용이 있으면 다시 말씀해 주세요.')
+
+        try:
+            candidate = TransferAccounts(**{**current, **changes})
+        except ValidationError:
+            return retry('edit', '요청하신 수정은 반영할 수 없습니다. 이체 금액은 0보다 큰 원 단위 정수여야 합니다. 기존 이체안을 그대로 유지합니다.')
+
+        reason = validate_transfer(load_data(), state['owner_id'], candidate.from_account, candidate.to_account, candidate.amount)
+        if reason:
+            return retry('edit', f'요청하신 수정은 반영할 수 없습니다. {reason} 기존 이체안을 그대로 유지합니다.')
+        return retry('edit', '수정한 내용을 반영했습니다. 바뀐 이체안을 다시 확인해 주세요.', transfer=candidate)
+
+    return transfer_interpret
+
+
+transfer_interpret = make_transfer_interpret()
 
 
 def transfer_execute(state: BankState) -> BankState:
     """승인된 이체를 다시 검증한 뒤 잔액·거래내역·처리 기록을 한 번에 저장하는 노드"""
+
+    if state.get('transfer_decision') != 'approve':
+        return transfer_end('승인이 확인되지 않아 이체를 진행하지 않았습니다. 잔액과 거래내역은 변경되지 않았습니다.')
 
     transfer = state['transfer']
     owner_id = state['owner_id']
@@ -211,16 +328,14 @@ def transfer_execute(state: BankState) -> BankState:
 
     reason = validate_transfer(data, owner_id, transfer.from_account, transfer.to_account, transfer.amount)
     if reason:
-        text = f'승인 이후 다시 확인해 보니 이체를 진행할 수 없습니다. {reason}'
-        return {'messages': [AIMessage(content=text)], 'transfer': None}
+        return transfer_end(f'승인 이후 다시 확인해 보니 이체를 진행할 수 없습니다. {reason}')
 
     completed = transfer.model_copy(update={'date': get_transfer_time()})
     try:
         new_data, record = apply_transfer(data, owner_id, completed.from_account, completed.to_account, completed.amount, completed.date)
         save_data(new_data)
     except Exception:
-        text = '저장 중 오류가 발생해 이체가 반영되지 않았습니다. 잔액과 거래내역은 그대로입니다.'
-        return {'messages': [AIMessage(content=text)], 'transfer': None}
+        return transfer_end('저장 중 오류가 발생해 이체가 반영되지 않았습니다. 잔액과 거래내역은 그대로입니다.')
 
     balances = {a['account_id']: a for a in new_data['accounts']}
     source, target = balances[completed.from_account], balances[completed.to_account]
@@ -230,24 +345,35 @@ def transfer_execute(state: BankState) -> BankState:
         f"- 이체 후 잔액: {source['nickname']} {source['balance']:,}원, {target['nickname']} {target['balance']:,}원\n"
         f"- 처리 번호: {record['request_id']}"
     )
-    return {'messages': [AIMessage(content=text)], 'transfer': None}
+    return transfer_end(text)
 
 
 def transfer_continues(state: BankState) -> str:
     return 'continue' if state.get('transfer') is not None else END
 
 
-def build_transfer_graph(extract=transfer_extract):
+def transfer_after_interpret(state: BankState) -> str:
+    if state.get('transfer') is None:
+        return END
+    return 'execute' if state.get('transfer_decision') == 'approve' else 'again'
+
+
+def build_transfer_graph(extract=transfer_extract, classifier=classify_response):
     builder = StateGraph(BankState)
     builder.add_node("transfer_extract", extract)
     builder.add_node("transfer_validate", transfer_validate)
     builder.add_node("transfer_approve", transfer_approve)
+    builder.add_node("transfer_interpret", make_transfer_interpret(classifier))
     builder.add_node("transfer_execute", transfer_execute)
 
     builder.add_edge(START, "transfer_extract")
     builder.add_conditional_edges("transfer_extract", transfer_continues, {"continue": "transfer_validate", END: END})
     builder.add_conditional_edges("transfer_validate", transfer_continues, {"continue": "transfer_approve", END: END})
-    builder.add_conditional_edges("transfer_approve", transfer_continues, {"continue": "transfer_execute", END: END})
+    builder.add_edge("transfer_approve", "transfer_interpret")
+    builder.add_conditional_edges(
+        "transfer_interpret", transfer_after_interpret,
+        {"execute": "transfer_execute", "again": "transfer_approve", END: END},
+    )
     builder.add_edge("transfer_execute", END)
     return builder.compile()
 

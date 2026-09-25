@@ -12,17 +12,14 @@ QUIT_WORDS = ('quit', 'exit', '종료')
 
 
 def ask_decision(payload: dict) -> str | None:
-    """그래프가 interrupt로 멈췄을 때 승인/거절을 받는다. 종료를 입력하면 None을 반환한다."""
+    """그래프가 interrupt로 멈췄을 때 사용자의 응답 원문을 받는다. 해석은 그래프가 한다. 종료를 입력하면 None을 반환한다."""
     print(f"\nBot: {payload['message']}")
     while True:
-        answer = input('승인 또는 거절을 입력해 주세요: ').strip()
+        answer = input('승인, 거절 또는 수정할 내용을 입력해 주세요: ').strip()
         if answer.lower() in QUIT_WORDS:
             return None
-        if answer == '승인':
-            return 'approve'
-        if answer == '거절':
-            return 'reject'
-        print('"승인" 또는 "거절"로만 답해 주세요.')
+        if answer:
+            return answer
 
 
 print('은행 업무 에이전트 (종료: quit)')
