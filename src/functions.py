@@ -196,6 +196,104 @@ def validate_transfer(data: dict, owner_id: str, from_account: str, to_account: 
     return None
 
 
+def compute_keep_balance_amount(data: dict, owner_id: str, from_account: str, keep_amount: int) -> int | None:
+    """출금 계좌에 keep_amount를 남기고 이체할 금액을 계산한다. 계좌를 찾을 수 없으면 None."""
+    mine = {a['account_id']: a for a in get_owner_accounts(data, owner_id)}
+    if from_account not in mine:
+        return None
+    return mine[from_account]['balance'] - keep_amount
+
+
+def validate_transfer_legs(data: dict, owner_id: str, from_account: str, legs: list[tuple[str, int]]) -> str | None:
+    """하나의 출금 계좌에서 여러 (입금 계좌, 금액) legs로 나가는 분할 이체를 검증한다."""
+    mine = {a['account_id']: a for a in get_owner_accounts(data, owner_id)}
+    if from_account not in mine:
+        return '이체할 수 없는 계좌가 포함되어 있습니다. 본인 소유의 계좌 사이에서만 이체할 수 있습니다.'
+
+    total = 0
+    for to_account, amount in legs:
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+            return '이체 금액은 각각 0보다 큰 원 단위 정수여야 합니다.'
+        if to_account not in mine:
+            return '이체할 수 없는 계좌가 포함되어 있습니다. 본인 소유의 계좌 사이에서만 이체할 수 있습니다.'
+        if to_account == from_account:
+            return '출금 계좌와 입금 계좌가 같습니다. 서로 다른 계좌를 지정해 주세요.'
+        total += amount
+
+    source = mine[from_account]
+    if source['balance'] < total:
+        return f"{source['nickname']} 계좌의 잔액({source['balance']:,}원)이 이체 금액 합계({total:,}원)보다 적어 이체할 수 없습니다."
+    return None
+
+
+def build_split_preview(data: dict, owner_id: str, from_account: str, legs: list[tuple[str, int]]) -> dict:
+    mine = {a['account_id']: a for a in get_owner_accounts(data, owner_id)}
+    source = mine[from_account]
+    total = sum(amount for _, amount in legs)
+    leg_previews = [
+        {
+            'account_id': to_account,
+            'nickname': mine[to_account]['nickname'],
+            'balance_before': mine[to_account]['balance'],
+            'balance_after': mine[to_account]['balance'] + amount,
+            'amount': amount,
+        }
+        for to_account, amount in legs
+    ]
+    return {
+        'from': {
+            'account_id': from_account,
+            'nickname': source['nickname'],
+            'balance_before': source['balance'],
+            'balance_after': source['balance'] - total,
+        },
+        'legs': leg_previews,
+        'total': total,
+    }
+
+
+def apply_transfer_legs(data: dict, owner_id: str, from_account: str, legs: list[tuple[str, int]],
+                         occurred_at: datetime) -> tuple[dict, list[dict]]:
+    """원본을 바꾸지 않고, 여러 legs의 잔액·거래·처리 기록을 한 번에 반영한 새 데이터를 반환한다.
+    legs 중 하나라도 저장할 수 없으면 예외를 던져 호출자가 원본을 그대로 유지하게 한다."""
+    new_data = copy.deepcopy(data)
+    accounts = {a['account_id']: a for a in new_data['accounts']}
+    total = sum(amount for _, amount in legs)
+    accounts[from_account]['balance'] -= total
+
+    last_number = max((int(t['transaction_id'].split('-')[1]) for t in new_data['transactions']), default=0)
+    stamp = occurred_at.isoformat(timespec='seconds')
+    records = []
+    offset = 0
+    for to_account, amount in legs:
+        accounts[to_account]['balance'] += amount
+
+        offset += 1
+        withdrawal_id = f'tx-{last_number + offset:03d}'
+        offset += 1
+        deposit_id = f'tx-{last_number + offset:03d}'
+        request_id = f"req-{len(new_data['requests']) + 1:03d}"
+
+        new_data['transactions'].append({
+            'transaction_id': withdrawal_id, 'owner_id': owner_id, 'account_id': from_account,
+            'type': 'withdrawal', 'amount': amount, 'occurred_at': stamp,
+            'card_id': None, 'merchant': None, 'request_id': request_id,
+        })
+        new_data['transactions'].append({
+            'transaction_id': deposit_id, 'owner_id': owner_id, 'account_id': to_account,
+            'type': 'deposit', 'amount': amount, 'occurred_at': stamp,
+            'card_id': None, 'merchant': None, 'request_id': request_id,
+        })
+        record = {
+            'request_id': request_id, 'type': 'transfer', 'owner_id': owner_id,
+            'from_account': from_account, 'to_account': to_account, 'amount': amount,
+            'status': 'completed', 'created_at': stamp,
+        }
+        new_data['requests'].append(record)
+        records.append(record)
+    return new_data, records
+
+
 def build_transfer_preview(data: dict, owner_id: str, from_account: str, to_account: str, amount: int) -> dict:
     mine = {a['account_id']: a for a in get_owner_accounts(data, owner_id)}
     source, target = mine[from_account], mine[to_account]
