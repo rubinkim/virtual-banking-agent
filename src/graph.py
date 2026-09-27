@@ -33,6 +33,9 @@ from functions import (
     build_split_preview,
     apply_transfer,
     apply_transfer_legs,
+    validate_nickname_change,
+    build_nickname_preview,
+    apply_nickname_change,
 )
 
 load_dotenv()
@@ -68,6 +71,11 @@ class SplitTransfer(BaseModel):
     date: datetime | None = Field(default=None, description="이체 시각. 실행 시점에 코드가 채운다")
 
 
+class NicknameChange(BaseModel):
+    account_id: str = Field(description="별명을 바꿀 계좌의 account_id")
+    new_nickname: str = Field(description="새 별명")
+
+
 class BankState(TypedDict):
     messages: Annotated[list, add_messages]
     owner_id: str
@@ -76,10 +84,14 @@ class BankState(TypedDict):
     transfer_response: str | None
     transfer_decision: str | None
     transfer_notice: str | None
+    nickname_change: NicknameChange | None
+    nickname_response: str | None
+    nickname_decision: str | None
+    nickname_notice: str | None
 
 
 class RouterDecision(BaseModel):
-    next: Literal["account_agent", "transfer_agent", "unsupported"]
+    next: Literal["account_agent", "transfer_agent", "nickname_agent", "unsupported"]
 
 router_llm = llm.with_structured_output(RouterDecision)
 
@@ -91,12 +103,13 @@ def supervisor(state: BankState) -> BankState:
     system = SystemMessage(
         content=(
             "당신은 은행 업무 요청을 분석해서 적절한 담당 agent로 routing하는 supervisor 입니다. "
-            "담당 agent는 두 가지입니다. "
-            "account_agent: 계좌 목록·잔액 조회, 거래내역 조회(카드로 결제한 거래내역·카드 사용 내역 조회도 여기에 포함). "
+            "담당 agent는 세 가지입니다. "
+            "account_agent: 계좌 목록·잔액 조회(총액 문의 포함), 거래내역 조회(카드로 결제한 거래내역·카드 사용 내역 조회도 여기에 포함). "
             "transfer_agent: 사용자 본인의 계좌 사이의 이체. 정액 이체, 특정 금액만 남기고 나머지를 이체하는 조건부 이체, "
             "하나의 계좌에서 여러 계좌로 나눠서 보내는 분할 이체를 모두 포함합니다. "
             "이체 정보(출금 계좌, 입금 계좌, 금액)를 되물은 직후 사용자가 그에 답하는 경우도 transfer_agent입니다. "
-            "unsupported: 위 두 agent가 처리하지 못하는 요청(카드 자체의 정지·잠금·재발급·목록·상태 조회, 청구서 조회·납부, 계좌 별명 변경, 일상 대화 등). "
+            "nickname_agent: 계좌의 별명(이름)을 바꾸는 요청. 별명 변경 정보(대상 계좌, 새 별명)를 되물은 직후 사용자가 그에 답하는 경우도 nickname_agent입니다. "
+            "unsupported: 위 agent들이 처리하지 못하는 요청(카드 자체의 정지·잠금·재발급·목록·상태 조회, 청구서 조회·납부, 일상 대화 등). "
             "단, 카드로 결제한 '거래내역'을 묻는 것은 unsupported가 아니라 account_agent입니다. "
             "억지로 가장 가까운 agent에 보내지 말고, 처리할 수 없는 요청이면 unsupported를 반환하세요. "
             "해당하는 agent의 이름을 그대로 반환하세요. "
@@ -124,6 +137,7 @@ def account_call_model(state: BankState) -> BankState:
             f"account_id를 모르면 생략하고 호출해 전체 계좌를 조회한 뒤, 그 결과(nickname 포함)를 보고 답변을 구성하세요. "
             f"사용자가 특정 계좌를 지목하지 않았다면 조회된 계좌 전부를 나열해서 답하세요. "
             f"사용자가 지목한 이름과 일치하는 계좌가 2개 이상이면, 실행하지 말고 어떤 계좌인지 사용자에게 되물으세요. "
+            f"여러 계좌의 총액을 물으면 직접 더하지 말고 tool 반환값의 total_balance를 그대로 답하세요. "
             f"거래내역을 조회할 때 특정 계좌(별명)가 지정되었다면, account_id를 모르는 경우 먼저 잔액 조회 tool로 계좌 목록을 확인해 account_id를 알아낸 뒤 거래내역 tool을 호출하세요. "
             f"기간 표현(이번 달, 지난주 등)은 날짜를 직접 계산하지 말고 period 키워드로 전달하세요. "
             f"오늘(기준일)은 {get_base_date().isoformat()}입니다. start_date/end_date를 지정할 때 연도가 없는 날짜(예: 9월 1일)는 기준일의 연도로 해석하세요. "
@@ -597,9 +611,196 @@ def build_transfer_graph(extract=transfer_extract, classifier=classify_response)
 transfer_graph = build_transfer_graph()
 
 
+class NicknameDraft(BaseModel):
+    account_id: str | None = Field(default=None, description="별명을 바꿀 계좌의 account_id. 특정할 수 없으면 null")
+    new_nickname: str | None = Field(default=None, description="새로 바꿀 별명. 밝히지 않았으면 null")
+
+
+nickname_extract_llm = llm.with_structured_output(NicknameDraft)
+
+NICKNAME_RESET = {'nickname_change': None, 'nickname_response': None, 'nickname_decision': None, 'nickname_notice': None}
+NICKNAME_CANCEL_TEXT = '별명 변경을 취소했습니다. 계좌 정보는 바뀌지 않았습니다.'
+
+
+def nickname_end(text: str) -> BankState:
+    """별명 변경 흐름을 끝내는 공통 처리: 안내 메시지를 남기고 관련 State를 전부 비운다"""
+    return {'messages': [AIMessage(content=text)], **NICKNAME_RESET}
+
+
+def nickname_extract(state: BankState) -> BankState:
+    """대화에서 별명 변경 정보(대상 계좌, 새 별명)를 뽑아 State.nickname_change를 채우는 노드"""
+
+    accounts = get_owner_accounts(load_data(), state['owner_id'])
+    account_lines = '\n'.join(f"- {a['account_id']}: {a['nickname']}" for a in accounts)
+    system = SystemMessage(
+        content=(
+            "당신은 계좌 별명 변경 요청에서 대상 계좌와 새 별명을 추출합니다. "
+            "대화에서 가장 최근의 별명 변경 요청 하나만 추출하고, 이미 완료되었거나 취소된 이전 요청은 무시하세요. "
+            "정보가 부족해 되물은 적이 있다면 사용자의 이번 답변을 합쳐서 판단하세요. "
+            f"사용자의 계좌 목록은 다음과 같습니다.\n{account_lines}\n"
+            "사용자가 별명으로 말하면 위 목록에서 해당 계좌의 account_id로 바꾸세요. "
+            "account_id를 직접 말했다면 목록에 없더라도 그대로 반환하세요. "
+            "일치하는 계좌가 2개 이상이면 특정할 수 없으므로 account_id를 null로 두세요. "
+            "새 별명은 사용자가 말한 표현 그대로(따옴표만 제외) 반환하세요. 밝히지 않았으면 null로 두세요."
+        )
+    )
+    draft = nickname_extract_llm.invoke([system, *state['messages']]) or NicknameDraft()
+
+    missing = []
+    if draft.account_id is None:
+        missing.append('별명을 바꿀 계좌')
+    if draft.new_nickname is None or not draft.new_nickname.strip():
+        missing.append('새 별명')
+    if missing:
+        names = ', '.join(a['nickname'] for a in accounts)
+        text = f"별명을 바꾸려면 {', '.join(missing)} 정보가 더 필요합니다. (보유 계좌: {names}) 다시 말씀해 주세요."
+        return nickname_end(text)
+
+    return {**NICKNAME_RESET, 'nickname_change': NicknameChange(account_id=draft.account_id, new_nickname=draft.new_nickname)}
+
+
+def nickname_validate(state: BankState) -> BankState:
+    """별명을 바꿀 수 있는 요청인지 검증하는 노드. 실패하면 이유를 안내하고 State를 비운다"""
+
+    change = state['nickname_change']
+    reason = validate_nickname_change(load_data(), state['owner_id'], change.account_id, change.new_nickname)
+    if reason:
+        return nickname_end(f'별명을 바꿀 수 없습니다. {reason}')
+    return {}
+
+
+def nickname_approve(state: BankState) -> BankState:
+    """변경안을 보여주고 interrupt로 사용자의 응답 원문을 받아 State에 저장하는 노드"""
+
+    change = state['nickname_change']
+    preview = build_nickname_preview(load_data(), state['owner_id'], change.account_id, change.new_nickname)
+    notice = state.get('nickname_notice')
+    message = (
+        (f'{notice}\n\n' if notice else '')
+        + '다음과 같이 계좌 별명을 바꿀까요?\n'
+        f"- 계좌: {preview['old_nickname']}({preview['account_id']}), 잔액 {preview['balance']:,}원\n"
+        f"- 새 별명: {preview['new_nickname']}"
+    )
+    response = interrupt({'message': message, 'preview': preview})
+
+    return {'nickname_response': response, 'nickname_notice': None, 'nickname_decision': None}
+
+
+class NicknameResponseInterpretation(BaseModel):
+    action: Literal['approve', 'reject', 'unclear'] = Field(
+        description="approve: 이 별명 변경에 분명히 동의 / reject: 바꾸지 않겠다 / unclear: 분명하지 않음"
+    )
+
+
+nickname_interpret_llm = llm.with_structured_output(NicknameResponseInterpretation)
+
+
+def classify_nickname_response(state: BankState) -> NicknameResponseInterpretation:
+    """승인 화면에 대한 사용자의 자연어 응답을 LLM으로 분류한다"""
+
+    change = state['nickname_change']
+    system = SystemMessage(
+        content=(
+            "당신은 계좌 별명 변경 승인 화면에 대한 사용자의 응답을 분류합니다. "
+            f"현재 변경안: {change.account_id}의 별명을 '{change.new_nickname.strip()}'(으)로 바꾸는 것입니다. "
+            "approve는 사용자가 이 변경에 분명하게 동의할 때만 선택하세요. "
+            "reject는 바꾸지 않겠다는 뜻입니다. "
+            "동의인지 거절인지 분명하지 않으면(수정을 요청하는 경우 포함) 반드시 unclear를 선택하세요."
+        )
+    )
+    return nickname_interpret_llm.invoke([system, HumanMessage(content=state['nickname_response'])])
+
+
+def make_nickname_interpret(classifier=classify_nickname_response):
+    """사용자의 응답을 승인·거절·불명확으로 해석하는 노드를 만든다. LLM 분류 뒤의 규칙은 전부 코드가 지킨다"""
+
+    def nickname_interpret(state: BankState) -> BankState:
+        response = (state.get('nickname_response') or '').strip()
+
+        if response in FAST_APPROVE_WORDS:
+            return {'nickname_response': None, 'nickname_decision': 'approve'}
+        if response in FAST_REJECT_WORDS:
+            return nickname_end(NICKNAME_CANCEL_TEXT)
+
+        try:
+            result = classifier(state)
+        except Exception:
+            result = None
+        if result is None or result.action == 'unclear':
+            return {
+                'nickname_response': None, 'nickname_decision': 'unclear',
+                'nickname_notice': "응답을 이해하지 못했습니다. '승인' 또는 '거절'이라고 말씀해 주세요.",
+            }
+        if result.action == 'reject':
+            return nickname_end(NICKNAME_CANCEL_TEXT)
+        return {'nickname_response': None, 'nickname_decision': 'approve'}
+
+    return nickname_interpret
+
+
+nickname_interpret = make_nickname_interpret()
+
+
+def nickname_execute(state: BankState) -> BankState:
+    """승인된 별명 변경을 다시 검증한 뒤 저장하는 노드"""
+
+    if state.get('nickname_decision') != 'approve':
+        return nickname_end('승인이 확인되지 않아 별명을 바꾸지 않았습니다.')
+
+    change = state['nickname_change']
+    owner_id = state['owner_id']
+    data = load_data()
+
+    reason = validate_nickname_change(data, owner_id, change.account_id, change.new_nickname)
+    if reason:
+        return nickname_end(f'승인 이후 다시 확인해 보니 별명을 바꿀 수 없습니다. {reason}')
+
+    try:
+        new_data, record = apply_nickname_change(data, owner_id, change.account_id, change.new_nickname)
+        save_data(new_data)
+    except Exception:
+        return nickname_end('저장 중 오류가 발생해 별명이 바뀌지 않았습니다.')
+
+    text = f"별명을 '{record['old_nickname']}'에서 '{record['new_nickname']}'(으)로 바꿨습니다."
+    return nickname_end(text)
+
+
+def nickname_continues(state: BankState) -> str:
+    return 'continue' if state.get('nickname_change') is not None else END
+
+
+def nickname_after_interpret(state: BankState) -> str:
+    if state.get('nickname_change') is None:
+        return END
+    return 'execute' if state.get('nickname_decision') == 'approve' else 'again'
+
+
+def build_nickname_graph(extract=nickname_extract, classifier=classify_nickname_response):
+    builder = StateGraph(BankState)
+    builder.add_node("nickname_extract", extract)
+    builder.add_node("nickname_validate", nickname_validate)
+    builder.add_node("nickname_approve", nickname_approve)
+    builder.add_node("nickname_interpret", make_nickname_interpret(classifier))
+    builder.add_node("nickname_execute", nickname_execute)
+
+    builder.add_edge(START, "nickname_extract")
+    builder.add_conditional_edges("nickname_extract", nickname_continues, {"continue": "nickname_validate", END: END})
+    builder.add_conditional_edges("nickname_validate", nickname_continues, {"continue": "nickname_approve", END: END})
+    builder.add_edge("nickname_approve", "nickname_interpret")
+    builder.add_conditional_edges(
+        "nickname_interpret", nickname_after_interpret,
+        {"execute": "nickname_execute", "again": "nickname_approve", END: END},
+    )
+    builder.add_edge("nickname_execute", END)
+    return builder.compile()
+
+
+nickname_graph = build_nickname_graph()
+
+
 UNSUPPORTED_TEXT = (
     '죄송합니다. 해당 요청은 아직 지원하지 않습니다. '
-    '현재는 계좌·잔액 조회, 거래내역 조회, 내 계좌 간 이체만 도와드릴 수 있습니다.'
+    '현재는 계좌·잔액 조회, 거래내역 조회, 내 계좌 간 이체, 계좌 별명 변경만 도와드릴 수 있습니다.'
 )
 
 
@@ -612,15 +813,22 @@ parent_builder = StateGraph(BankState)
 parent_builder.add_node("supervisor", supervisor)
 parent_builder.add_node("account_agent", account_graph)
 parent_builder.add_node("transfer_agent", transfer_graph)
+parent_builder.add_node("nickname_agent", nickname_graph)
 parent_builder.add_node("unsupported", unsupported_reply)
 
 parent_builder.add_edge(START, "supervisor")
 parent_builder.add_conditional_edges(
     "supervisor", route_from_supervisor,
-    {"account_agent": "account_agent", "transfer_agent": "transfer_agent", "unsupported": "unsupported"},
+    {
+        "account_agent": "account_agent",
+        "transfer_agent": "transfer_agent",
+        "nickname_agent": "nickname_agent",
+        "unsupported": "unsupported",
+    },
 )
 parent_builder.add_edge("account_agent", END)
 parent_builder.add_edge("transfer_agent", END)
+parent_builder.add_edge("nickname_agent", END)
 parent_builder.add_edge("unsupported", END)
 
 checkpoint_serde = JsonPlusSerializer(
@@ -628,6 +836,7 @@ checkpoint_serde = JsonPlusSerializer(
         (TransferAccounts.__module__, TransferAccounts.__name__),
         (TransferLeg.__module__, TransferLeg.__name__),
         (SplitTransfer.__module__, SplitTransfer.__name__),
+        (NicknameChange.__module__, NicknameChange.__name__),
     ]
 )
 parent_graph = parent_builder.compile(checkpointer=InMemorySaver(serde=checkpoint_serde))

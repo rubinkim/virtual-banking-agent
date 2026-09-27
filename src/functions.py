@@ -23,8 +23,8 @@ def get_base_date() -> date:
 
 @tool(parse_docstring=True)
 def get_account_balance_by_owner(owner_id: str, account_id: str | None = None) -> str:
-    """계좌 잔액을 조회한다.
-    
+    """계좌 잔액을 조회한다. 여러 계좌의 총액을 물으면 반환값의 total_balance를 그대로 쓰고 직접 더하지 않는다.
+
     Args:
         owner_id: 계좌 소유주의 아이디
         account_id: 조회할 계좌 번호. 생략하면 (None) 해당 owner_id의 모든 계좌를 조회한다.
@@ -44,7 +44,8 @@ def get_account_balance_by_owner(owner_id: str, account_id: str | None = None) -
         'accounts': [
             {'account_id': acc['account_id'], 'nickname': acc['nickname'], 'balance': acc['balance']}
             for acc in matched
-        ]
+        ],
+        'total_balance': sum(acc['balance'] for acc in matched),
     })
 
 
@@ -346,6 +347,61 @@ def apply_transfer(data: dict, owner_id: str, from_account: str, to_account: str
         'from_account': from_account,
         'to_account': to_account,
         'amount': amount,
+        'status': 'completed',
+        'created_at': stamp,
+    }
+    new_data['requests'].append(record)
+    return new_data, record
+
+
+NICKNAME_MIN_LEN = 1
+NICKNAME_MAX_LEN = 20
+
+
+def validate_nickname_change(data: dict, owner_id: str, account_id: str, new_nickname: str) -> str | None:
+    """별명을 바꿀 수 없으면 그 이유를, 가능하면 None을 반환한다."""
+    mine = {a['account_id']: a for a in get_owner_accounts(data, owner_id)}
+    if account_id not in mine:
+        return '이체할 수 없는 계좌가 포함되어 있습니다. 본인 소유의 계좌만 별명을 바꿀 수 있습니다.'
+
+    name = new_nickname.strip()
+    if not (NICKNAME_MIN_LEN <= len(name) <= NICKNAME_MAX_LEN):
+        return f'별명은 공백을 제외하고 {NICKNAME_MIN_LEN}자 이상 {NICKNAME_MAX_LEN}자 이하여야 합니다.'
+    if name == mine[account_id]['nickname']:
+        return '이미 같은 별명입니다.'
+    if any(a['nickname'] == name for aid, a in mine.items() if aid != account_id):
+        return f"'{name}'은(는) 이미 다른 계좌에서 쓰고 있는 별명입니다."
+    return None
+
+
+def build_nickname_preview(data: dict, owner_id: str, account_id: str, new_nickname: str) -> dict:
+    mine = {a['account_id']: a for a in get_owner_accounts(data, owner_id)}
+    account = mine[account_id]
+    return {
+        'account_id': account_id,
+        'old_nickname': account['nickname'],
+        'new_nickname': new_nickname.strip(),
+        'balance': account['balance'],
+    }
+
+
+def apply_nickname_change(data: dict, owner_id: str, account_id: str, new_nickname: str) -> tuple[dict, dict]:
+    """원본을 바꾸지 않고, 별명이 바뀐 새 데이터와 처리 기록을 반환한다."""
+    new_data = copy.deepcopy(data)
+    accounts = {a['account_id']: a for a in new_data['accounts']}
+    old_nickname = accounts[account_id]['nickname']
+    name = new_nickname.strip()
+    accounts[account_id]['nickname'] = name
+
+    request_id = f"req-{len(new_data['requests']) + 1:03d}"
+    stamp = get_transfer_time().isoformat(timespec='seconds')
+    record = {
+        'request_id': request_id,
+        'type': 'nickname_change',
+        'owner_id': owner_id,
+        'account_id': account_id,
+        'old_nickname': old_nickname,
+        'new_nickname': name,
         'status': 'completed',
         'created_at': stamp,
     }
