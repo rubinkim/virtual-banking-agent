@@ -36,15 +36,35 @@ from functions import (
     validate_nickname_change,
     build_nickname_preview,
     apply_nickname_change,
+    get_owner_cards,
+    get_owner_addresses,
+    get_cards_by_owner,
+    get_reissue_applications_by_owner,
+    CARD_STATUS_LABELS,
+    REISSUE_STATUS_LABELS,
+    validate_card_status_change,
+    build_card_status_preview,
+    apply_card_status_change,
+    validate_reissue_create,
+    build_reissue_create_preview,
+    apply_reissue_create,
+    get_owner_reissue,
+    validate_reissue_edit,
+    validate_reissue_cancel,
+    build_reissue_manage_preview,
+    apply_reissue_edit,
+    apply_reissue_cancel,
 )
 
 load_dotenv()
 GEMINI_MODEL = os.getenv('GEMINI_MODEL')
 
 account_tools = [get_account_balance_by_owner, get_account_transactions_by_owner]
+card_tools = [get_cards_by_owner, get_reissue_applications_by_owner]
 
 llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL)
 llm_with_tools = llm.bind_tools(account_tools)
+llm_with_card_tools = llm.bind_tools(card_tools)
 
 
 class TransferAccounts(BaseModel):
@@ -76,6 +96,22 @@ class NicknameChange(BaseModel):
     new_nickname: str = Field(description="새 별명")
 
 
+class CardStatusAction(BaseModel):
+    card_id: str = Field(description="상태를 바꿀 카드의 card_id")
+    kind: Literal['lost', 'lock', 'unlock'] = Field(
+        description="lost: 분실 정지 / lock: 일시 잠금 / unlock: 잠금 해제"
+    )
+
+
+class ReissueAction(BaseModel):
+    kind: Literal['create', 'edit', 'cancel'] = Field(
+        description="create: 재발급 신청 / edit: 배송지 변경 / cancel: 신청 취소"
+    )
+    card_id: str | None = Field(default=None, description="create일 때 재발급 대상 카드의 card_id")
+    reissue_id: str | None = Field(default=None, description="edit/cancel일 때 대상 신청의 reissue_id")
+    delivery_address_id: str | None = Field(default=None, description="create/edit일 때 배송지 address_id")
+
+
 class BankState(TypedDict):
     messages: Annotated[list, add_messages]
     owner_id: str
@@ -88,10 +124,23 @@ class BankState(TypedDict):
     nickname_response: str | None
     nickname_decision: str | None
     nickname_notice: str | None
+    card_status_action: CardStatusAction | None
+    card_status_response: str | None
+    card_status_decision: str | None
+    card_status_notice: str | None
+    reissue_action: ReissueAction | None
+    reissue_response: str | None
+    reissue_decision: str | None
+    reissue_notice: str | None
+    pending_reissue_card_id: str | None
 
 
 class RouterDecision(BaseModel):
-    next: Literal["account_agent", "transfer_agent", "nickname_agent", "unsupported"]
+    next: Literal[
+        "account_agent", "transfer_agent", "nickname_agent",
+        "card_agent", "card_status_agent", "reissue_agent", "card_lost_and_reissue_agent",
+        "unsupported",
+    ]
 
 router_llm = llm.with_structured_output(RouterDecision)
 
@@ -103,17 +152,24 @@ def supervisor(state: BankState) -> BankState:
     system = SystemMessage(
         content=(
             "당신은 은행 업무 요청을 분석해서 적절한 담당 agent로 routing하는 supervisor 입니다. "
-            "담당 agent는 세 가지입니다. "
+            "담당 agent는 다음과 같습니다. "
             "account_agent: 계좌 목록·잔액 조회(총액 문의 포함), 거래내역 조회(카드로 결제한 거래내역·카드 사용 내역 조회도 여기에 포함). "
             "transfer_agent: 사용자 본인의 계좌 사이의 이체. 정액 이체, 특정 금액만 남기고 나머지를 이체하는 조건부 이체, "
             "하나의 계좌에서 여러 계좌로 나눠서 보내는 분할 이체를 모두 포함합니다. "
             "이체 정보(출금 계좌, 입금 계좌, 금액)를 되물은 직후 사용자가 그에 답하는 경우도 transfer_agent입니다. "
             "nickname_agent: 계좌의 별명(이름)을 바꾸는 요청. 별명 변경 정보(대상 계좌, 새 별명)를 되물은 직후 사용자가 그에 답하는 경우도 nickname_agent입니다. "
-            "unsupported: 위 agent들이 처리하지 못하는 요청(카드 자체의 정지·잠금·재발급·목록·상태 조회, 청구서 조회·납부, 일상 대화 등). "
+            "card_agent: 카드 목록·종류·상태 조회, 카드 재발급 신청 내역(배송지·처리 상태) 조회. "
+            "card_status_agent: 카드의 분실 정지, 일시 잠금, 잠금 해제 중 **하나만** 요청하는 경우. "
+            "reissue_agent: 카드 재발급 신청(새로 신청), 재발급 신청의 배송지 변경, 재발급 신청 취소. "
+            "card_lost_and_reissue_agent: 카드 분실 정지와 재발급 신청을 **한 문장에서 함께** 요청하는 경우"
+            "(예: '카드 잃어버렸어. 정지하고 재발급해줘'). 분실 정지만 요청하면 card_status_agent, "
+            "재발급만 요청하면(카드가 이미 분실 정지된 상태라고 말하는 경우 포함) reissue_agent로 보내세요. "
+            "위 되묻기(부족한 정보 요청) 직후 사용자가 그에 답하는 경우도 같은 agent로 보내세요. "
+            "unsupported: 위 agent들이 처리하지 못하는 요청(청구서 조회·납부, 일상 대화 등). "
             "단, 카드로 결제한 '거래내역'을 묻는 것은 unsupported가 아니라 account_agent입니다. "
             "억지로 가장 가까운 agent에 보내지 말고, 처리할 수 없는 요청이면 unsupported를 반환하세요. "
             "해당하는 agent의 이름을 그대로 반환하세요. "
-        )        
+        )
     )
     decision = router_llm.invoke([system, *messages])
     return {'next': decision.next}
@@ -168,6 +224,42 @@ account_builder.add_conditional_edges(
 )
 account_builder.add_edge("tools", "account_call_model")  # tool 결과를 다시 모델에게 넘겨 답변을 생성하도록 설계한다.
 account_graph = account_builder.compile()
+
+
+def card_call_model(state: BankState) -> BankState:
+    """사용자 요청을 보고 카드 조회 tool을 부를지, 어떤 tool을 부를지 판단하는 노드"""
+
+    owner_id = state['owner_id']
+    messages = state['messages']
+    system = SystemMessage(
+        content=(
+            f"당신은 cards domain(카드 목록·종류·상태 조회, 카드 재발급 신청 내역 조회)의 조회 업무를 처리하는 agent입니다. "
+            f"카드의 분실 정지·일시 잠금·잠금 해제·재발급 신청·재발급 신청 수정·취소는 별도의 담당 agent가 처리하니, "
+            f"그런 요청이 섞여 있어도 조회할 수 있는 부분만 답하고 나머지는 언급하지 마세요. "
+            f"현재 login한 사용자의 owner_id는 '{owner_id}'입니다. "
+            f"tool을 호출할 때 owner_id가 필요하다면 이 값을 owner_id 인자로 그대로 사용하세요. "
+            f"owner_id 같은 내부 식별자는 답변에 언급하지 마세요. "
+            f"card_id를 모르면 생략하고 호출해 전체 카드를 조회한 뒤, 그 결과를 보고 답변을 구성하세요. "
+            f"사용자가 특정 카드를 지목하지 않았다면 조회된 전체를 나열해서 답하세요. "
+            f"사용자가 지목한 이름과 일치하는 카드가 2개 이상이면, 실행하지 말고 어떤 카드인지 사용자에게 되물으세요. "
+            f"재발급 신청을 조회할 때 어떤 신청인지 불명확하면(여러 건이 조회되면) 목록을 보여주고 어떤 신청인지 되물으세요. "
+            f"해당하는 신청이 없으면 신청 기록이 없다고 안내하세요."
+        )
+    )
+    response = llm_with_card_tools.invoke([system, *messages])
+    return {'messages': [response]}
+
+
+card_builder = StateGraph(BankState)
+card_builder.add_node("card_call_model", card_call_model)
+card_builder.add_node("tools", ToolNode(card_tools, wrap_tool_call=enforce_owner))
+
+card_builder.add_edge(START, "card_call_model")
+card_builder.add_conditional_edges(
+    "card_call_model", tools_condition, {"tools": "tools", END: END}
+)
+card_builder.add_edge("tools", "card_call_model")
+card_graph = card_builder.compile()
 
 
 class TransferLegDraft(BaseModel):
@@ -798,9 +890,598 @@ def build_nickname_graph(extract=nickname_extract, classifier=classify_nickname_
 nickname_graph = build_nickname_graph()
 
 
+# ---------- card_status_agent (분실 정지 / 일시 잠금 / 잠금 해제) ----------
+
+class CardStatusDraft(BaseModel):
+    card_id: str | None = Field(default=None, description="상태를 바꿀 카드의 card_id. 특정할 수 없으면 null")
+    kind: Literal['lost', 'lock', 'unlock'] | None = Field(
+        default=None, description="lost: 분실 정지 / lock: 일시 잠금 / unlock: 잠금 해제. 특정할 수 없으면 null"
+    )
+
+
+card_status_extract_llm = llm.with_structured_output(CardStatusDraft)
+
+CARD_STATUS_RESET = {
+    'card_status_action': None, 'card_status_response': None,
+    'card_status_decision': None, 'card_status_notice': None,
+}
+CARD_STATUS_CANCEL_TEXT = '요청을 취소했습니다. 카드 상태는 바뀌지 않았습니다.'
+CARD_STATUS_KIND_LABELS = {'lost': '분실 정지', 'lock': '일시 잠금', 'unlock': '잠금 해제'}
+
+
+def card_status_end(text: str) -> BankState:
+    """카드 상태 변경 흐름을 끝내는 공통 처리: 안내 메시지를 남기고 관련 State를 전부 비운다"""
+    return {'messages': [AIMessage(content=text)], **CARD_STATUS_RESET}
+
+
+def card_status_extract(state: BankState) -> BankState:
+    """대화에서 대상 카드와 처리 종류(분실 정지/일시 잠금/잠금 해제)를 뽑는 노드"""
+
+    cards = get_owner_cards(load_data(), state['owner_id'])
+    card_lines = '\n'.join(
+        f"- {c['card_id']}: {c['name']} ({CARD_STATUS_LABELS.get(c['status'], c['status'])})" for c in cards
+    )
+    system = SystemMessage(
+        content=(
+            "당신은 카드 상태 변경 요청에서 대상 카드와 처리 종류를 추출합니다. "
+            "처리 종류는 세 가지입니다. lost(분실 정지), lock(일시 잠금), unlock(잠금 해제). "
+            "대화에서 가장 최근의 요청 하나만 추출하고, 이미 완료되었거나 취소된 이전 요청은 무시하세요. "
+            "정보가 부족해 되물은 적이 있다면 사용자의 이번 답변을 합쳐서 판단하세요. "
+            f"사용자의 카드 목록은 다음과 같습니다(괄호 안은 현재 상태).\n{card_lines}\n"
+            "사용자가 카드 이름으로 말하면 위 목록에서 해당 카드의 card_id로 바꾸세요. "
+            "card_id를 직접 말했다면 목록에 없더라도 그대로 반환하세요. "
+            "일치하는 카드가 2개 이상이면 특정할 수 없으므로 card_id를 null로 두세요."
+        )
+    )
+    draft = card_status_extract_llm.invoke([system, *state['messages']]) or CardStatusDraft()
+
+    missing = []
+    if draft.card_id is None:
+        missing.append('대상 카드')
+    if draft.kind is None:
+        missing.append('처리 종류(분실 정지/일시 잠금/잠금 해제)')
+    if missing:
+        names = ', '.join(c['name'] for c in cards)
+        text = f"{', '.join(missing)}를 알려주세요. (보유 카드: {names})"
+        return card_status_end(text)
+
+    return {**CARD_STATUS_RESET, 'card_status_action': CardStatusAction(card_id=draft.card_id, kind=draft.kind)}
+
+
+def card_status_validate(state: BankState) -> BankState:
+    """카드 상태를 바꿀 수 있는 요청인지 검증하는 노드. 실패하면 이유를 안내하고 State를 비운다"""
+
+    action = state['card_status_action']
+    reason = validate_card_status_change(load_data(), state['owner_id'], action.card_id, action.kind)
+    if reason:
+        return card_status_end(f'처리할 수 없습니다. {reason}')
+    return {}
+
+
+def card_status_approve(state: BankState) -> BankState:
+    """처리안을 보여주고 interrupt로 사용자의 응답 원문을 받아 State에 저장하는 노드"""
+
+    action = state['card_status_action']
+    preview = build_card_status_preview(load_data(), state['owner_id'], action.card_id, action.kind)
+    notice = state.get('card_status_notice')
+    kind_label = CARD_STATUS_KIND_LABELS[action.kind]
+    message = (
+        (f'{notice}\n\n' if notice else '')
+        + f'다음과 같이 카드를 {kind_label} 처리할까요?\n'
+        f"- 카드: {preview['name']}({preview['card_id']})\n"
+        f"- 현재 상태: {preview['old_status']} → 처리 후: {preview['new_status']}"
+    )
+    response = interrupt({'message': message, 'preview': preview})
+
+    return {'card_status_response': response, 'card_status_notice': None, 'card_status_decision': None}
+
+
+class CardStatusResponseInterpretation(BaseModel):
+    action: Literal['approve', 'reject', 'unclear'] = Field(
+        description="approve: 이 처리에 분명히 동의 / reject: 하지 않겠다 / unclear: 분명하지 않음"
+    )
+
+
+card_status_interpret_llm = llm.with_structured_output(CardStatusResponseInterpretation)
+
+
+def classify_card_status_response(state: BankState) -> CardStatusResponseInterpretation:
+    """승인 화면에 대한 사용자의 자연어 응답을 LLM으로 분류한다"""
+
+    action = state['card_status_action']
+    kind_label = CARD_STATUS_KIND_LABELS[action.kind]
+    system = SystemMessage(
+        content=(
+            "당신은 카드 상태 변경 승인 화면에 대한 사용자의 응답을 분류합니다. "
+            f"현재 처리안: 카드 {action.card_id}를 {kind_label} 처리하는 것입니다. "
+            "approve는 사용자가 이 처리에 분명하게 동의할 때만 선택하세요. "
+            "reject는 하지 않겠다는 뜻입니다. "
+            "동의인지 거절인지 분명하지 않으면(수정을 요청하는 경우 포함) 반드시 unclear를 선택하세요."
+        )
+    )
+    return card_status_interpret_llm.invoke([system, HumanMessage(content=state['card_status_response'])])
+
+
+def make_card_status_interpret(classifier=classify_card_status_response):
+    """사용자의 응답을 승인·거절·불명확으로 해석하는 노드를 만든다. LLM 분류 뒤의 규칙은 전부 코드가 지킨다"""
+
+    def card_status_interpret(state: BankState) -> BankState:
+        response = (state.get('card_status_response') or '').strip()
+
+        if response in FAST_APPROVE_WORDS:
+            return {'card_status_response': None, 'card_status_decision': 'approve'}
+        if response in FAST_REJECT_WORDS:
+            return card_status_end(CARD_STATUS_CANCEL_TEXT)
+
+        try:
+            result = classifier(state)
+        except Exception:
+            result = None
+        if result is None or result.action == 'unclear':
+            return {
+                'card_status_response': None, 'card_status_decision': 'unclear',
+                'card_status_notice': "응답을 이해하지 못했습니다. '승인' 또는 '거절'이라고 말씀해 주세요.",
+            }
+        if result.action == 'reject':
+            return card_status_end(CARD_STATUS_CANCEL_TEXT)
+        return {'card_status_response': None, 'card_status_decision': 'approve'}
+
+    return card_status_interpret
+
+
+card_status_interpret = make_card_status_interpret()
+
+
+def card_status_execute(state: BankState) -> BankState:
+    """승인된 처리를 다시 검증한 뒤 저장하는 노드"""
+
+    if state.get('card_status_decision') != 'approve':
+        return card_status_end('승인이 확인되지 않아 처리하지 않았습니다.')
+
+    action = state['card_status_action']
+    owner_id = state['owner_id']
+    data = load_data()
+
+    reason = validate_card_status_change(data, owner_id, action.card_id, action.kind)
+    if reason:
+        return card_status_end(f'승인 이후 다시 확인해 보니 처리할 수 없습니다. {reason}')
+
+    try:
+        new_data, record = apply_card_status_change(data, owner_id, action.card_id, action.kind)
+        save_data(new_data)
+    except Exception:
+        return card_status_end('저장 중 오류가 발생해 처리되지 않았습니다.')
+
+    text = f"카드를 {CARD_STATUS_LABELS.get(record['new_status'], record['new_status'])} 상태로 변경했습니다."
+    return card_status_end(text)
+
+
+def card_status_continues(state: BankState) -> str:
+    return 'continue' if state.get('card_status_action') is not None else END
+
+
+def card_status_after_interpret(state: BankState) -> str:
+    if state.get('card_status_action') is None:
+        return END
+    return 'execute' if state.get('card_status_decision') == 'approve' else 'again'
+
+
+def build_card_status_graph(extract=card_status_extract, classifier=classify_card_status_response):
+    builder = StateGraph(BankState)
+    builder.add_node("card_status_extract", extract)
+    builder.add_node("card_status_validate", card_status_validate)
+    builder.add_node("card_status_approve", card_status_approve)
+    builder.add_node("card_status_interpret", make_card_status_interpret(classifier))
+    builder.add_node("card_status_execute", card_status_execute)
+
+    builder.add_edge(START, "card_status_extract")
+    builder.add_conditional_edges("card_status_extract", card_status_continues, {"continue": "card_status_validate", END: END})
+    builder.add_conditional_edges("card_status_validate", card_status_continues, {"continue": "card_status_approve", END: END})
+    builder.add_edge("card_status_approve", "card_status_interpret")
+    builder.add_conditional_edges(
+        "card_status_interpret", card_status_after_interpret,
+        {"execute": "card_status_execute", "again": "card_status_approve", END: END},
+    )
+    builder.add_edge("card_status_execute", END)
+    return builder.compile()
+
+
+card_status_graph = build_card_status_graph()
+
+
+# ---------- reissue_agent (재발급 신청 / 배송지 변경 / 신청 취소) ----------
+
+class ReissueLegDraft(BaseModel):
+    reissue_id: str | None = Field(default=None, description="대상 신청의 reissue_id. 특정할 수 없으면 null")
+
+
+class ReissueDraft(BaseModel):
+    kind: Literal['create', 'edit', 'cancel'] = Field(
+        description="create: 새로 재발급 신청 / edit: 기존 신청의 배송지 변경 / cancel: 기존 신청 취소"
+    )
+    card_id: str | None = Field(default=None, description="create일 때 재발급 대상 카드의 card_id")
+    reissue_id: str | None = Field(default=None, description="edit/cancel일 때 대상 신청의 reissue_id")
+    delivery_address_id: str | None = Field(default=None, description="create/edit일 때 배송지의 address_id")
+
+
+reissue_extract_llm = llm.with_structured_output(ReissueDraft)
+
+REISSUE_RESET = {
+    'reissue_action': None, 'reissue_response': None, 'reissue_decision': None, 'reissue_notice': None,
+}
+REISSUE_CANCEL_TEXT = '요청을 취소했습니다. 재발급 신청은 바뀌지 않았습니다.'
+
+
+def reissue_end(text: str) -> BankState:
+    """재발급 관련 흐름을 끝내는 공통 처리: 안내 메시지를 남기고 관련 State를 전부 비운다"""
+    return {'messages': [AIMessage(content=text)], **REISSUE_RESET}
+
+
+def reissue_extract(state: BankState) -> BankState:
+    """대화에서 재발급 신청·배송지 변경·신청 취소에 필요한 정보를 뽑는 노드"""
+
+    data = load_data()
+    owner_id = state['owner_id']
+    cards = get_owner_cards(data, owner_id)
+    addresses = get_owner_addresses(data, owner_id)
+    open_apps = [r for r in data['reissue_applications'] if r['owner_id'] == owner_id and r['status'] != 'cancelled']
+    card_names = {c['card_id']: c['name'] for c in cards}
+
+    card_lines = '\n'.join(
+        f"- {c['card_id']}: {c['name']} ({CARD_STATUS_LABELS.get(c['status'], c['status'])})" for c in cards
+    )
+    address_lines = '\n'.join(f"- {a['address_id']}: {a['label']}" for a in addresses)
+    app_lines = '\n'.join(
+        f"- {r['reissue_id']}: {card_names.get(r['card_id'], r['card_id'])} "
+        f"({REISSUE_STATUS_LABELS.get(r['status'], r['status'])})"
+        for r in open_apps
+    ) or '(없음)'
+
+    system = SystemMessage(
+        content=(
+            "당신은 카드 재발급 신청·배송지 변경·신청 취소 요청에서 필요한 정보를 추출합니다. "
+            "kind는 세 가지입니다. create(새로 재발급 신청), edit(기존 신청의 배송지 변경), cancel(기존 신청 취소). "
+            "대화에서 가장 최근의 요청 하나만 추출하고, 이미 완료되었거나 취소된 이전 요청은 무시하세요. "
+            "정보가 부족해 되물은 적이 있다면 사용자의 이번 답변을 합쳐서 판단하세요. "
+            f"사용자의 카드 목록(괄호 안은 상태):\n{card_lines}\n"
+            f"사용자의 등록된 배송지:\n{address_lines}\n"
+            f"취소되지 않은 재발급 신청 목록:\n{app_lines}\n"
+            "카드 이름·배송지 이름으로 말하면 위 목록에서 해당 id로 바꾸세요. id를 직접 말했다면 목록에 없더라도 그대로 반환하세요. "
+            "edit/cancel에서 대상 신청이 정확히 1건뿐이면 그 reissue_id를 쓰고, "
+            "말하지 않았는데 2건 이상이거나 특정할 수 없으면 reissue_id를 null로 두세요."
+        )
+    )
+    draft = reissue_extract_llm.invoke([system, *state['messages']]) or ReissueDraft(kind='create')
+
+    if draft.kind == 'create':
+        missing = []
+        if draft.card_id is None:
+            missing.append('재발급받을 카드')
+        if draft.delivery_address_id is None:
+            missing.append('배송지')
+        if missing:
+            names = ', '.join(c['name'] for c in cards)
+            addr_names = ', '.join(a['label'] for a in addresses)
+            return reissue_end(f"{', '.join(missing)}를 알려주세요. (보유 카드: {names} / 등록된 배송지: {addr_names})")
+        return {**REISSUE_RESET, 'reissue_action': ReissueAction(
+            kind='create', card_id=draft.card_id, delivery_address_id=draft.delivery_address_id,
+        )}
+
+    if draft.reissue_id is None:
+        if not open_apps:
+            return reissue_end('취소되지 않은 재발급 신청이 없습니다.')
+        return reissue_end('어떤 재발급 신청인지 특정할 수 없습니다. 대상 카드를 말씀해 주세요.')
+
+    if draft.kind == 'edit':
+        if draft.delivery_address_id is None:
+            addr_names = ', '.join(a['label'] for a in addresses)
+            return reissue_end(f"새 배송지를 알려주세요. (등록된 배송지: {addr_names})")
+        return {**REISSUE_RESET, 'reissue_action': ReissueAction(
+            kind='edit', reissue_id=draft.reissue_id, delivery_address_id=draft.delivery_address_id,
+        )}
+
+    return {**REISSUE_RESET, 'reissue_action': ReissueAction(kind='cancel', reissue_id=draft.reissue_id)}
+
+
+def reissue_validate(state: BankState) -> BankState:
+    """처리할 수 있는 요청인지 검증하는 노드. 실패하면 이유를 안내하고 State를 비운다"""
+
+    action = state['reissue_action']
+    data = load_data()
+    owner_id = state['owner_id']
+    if action.kind == 'create':
+        reason = validate_reissue_create(data, owner_id, action.card_id, action.delivery_address_id)
+    elif action.kind == 'edit':
+        reason = validate_reissue_edit(data, owner_id, action.reissue_id, action.delivery_address_id)
+    else:
+        reason = validate_reissue_cancel(data, owner_id, action.reissue_id)
+    if reason:
+        return reissue_end(f'처리할 수 없습니다. {reason}')
+    return {}
+
+
+REISSUE_KIND_HEADERS = {
+    'create': '다음과 같이 카드 재발급을 신청할까요?',
+    'edit': '다음과 같이 배송지를 바꿀까요?',
+    'cancel': '다음 재발급 신청을 취소할까요?',
+}
+
+
+def reissue_approve(state: BankState) -> BankState:
+    """처리안을 보여주고 interrupt로 사용자의 응답 원문을 받아 State에 저장하는 노드"""
+
+    action = state['reissue_action']
+    data = load_data()
+    owner_id = state['owner_id']
+    notice = state.get('reissue_notice')
+    header = REISSUE_KIND_HEADERS[action.kind]
+
+    if action.kind == 'create':
+        preview = build_reissue_create_preview(data, owner_id, action.card_id, action.delivery_address_id)
+        body = (
+            f"- 카드: {preview['card_name']}({preview['card_id']})\n"
+            f"- 배송지: {preview['address_label']}({preview['address']})"
+        )
+    elif action.kind == 'edit':
+        preview = build_reissue_manage_preview(data, owner_id, action.reissue_id, action.delivery_address_id)
+        body = (
+            f"- 신청: {preview['reissue_id']} ({preview['card_name']})\n"
+            f"- 배송지: {preview['current_address']} → {preview['new_address']}"
+        )
+    else:
+        preview = build_reissue_manage_preview(data, owner_id, action.reissue_id)
+        body = f"- 신청: {preview['reissue_id']} ({preview['card_name']}, 배송지: {preview['current_address']})"
+
+    message = (f'{notice}\n\n' if notice else '') + f'{header}\n{body}'
+    response = interrupt({'message': message, 'preview': preview})
+
+    return {'reissue_response': response, 'reissue_notice': None, 'reissue_decision': None}
+
+
+class ReissueResponseInterpretation(BaseModel):
+    action: Literal['approve', 'reject', 'unclear'] = Field(
+        description="approve: 이 처리에 분명히 동의 / reject: 하지 않겠다 / unclear: 분명하지 않음"
+    )
+
+
+reissue_interpret_llm = llm.with_structured_output(ReissueResponseInterpretation)
+
+
+def classify_reissue_response(state: BankState) -> ReissueResponseInterpretation:
+    """승인 화면에 대한 사용자의 자연어 응답을 LLM으로 분류한다"""
+
+    action = state['reissue_action']
+    system = SystemMessage(
+        content=(
+            "당신은 카드 재발급 관련 승인 화면에 대한 사용자의 응답을 분류합니다. "
+            f"현재 처리안: kind={action.kind}, card_id={action.card_id}, reissue_id={action.reissue_id}. "
+            "approve는 사용자가 이 처리에 분명하게 동의할 때만 선택하세요. "
+            "reject는 하지 않겠다는 뜻입니다. "
+            "동의인지 거절인지 분명하지 않으면(수정을 요청하는 경우 포함) 반드시 unclear를 선택하세요."
+        )
+    )
+    return reissue_interpret_llm.invoke([system, HumanMessage(content=state['reissue_response'])])
+
+
+def make_reissue_interpret(classifier=classify_reissue_response):
+    """사용자의 응답을 승인·거절·불명확으로 해석하는 노드를 만든다. LLM 분류 뒤의 규칙은 전부 코드가 지킨다"""
+
+    def reissue_interpret(state: BankState) -> BankState:
+        response = (state.get('reissue_response') or '').strip()
+
+        if response in FAST_APPROVE_WORDS:
+            return {'reissue_response': None, 'reissue_decision': 'approve'}
+        if response in FAST_REJECT_WORDS:
+            return reissue_end(REISSUE_CANCEL_TEXT)
+
+        try:
+            result = classifier(state)
+        except Exception:
+            result = None
+        if result is None or result.action == 'unclear':
+            return {
+                'reissue_response': None, 'reissue_decision': 'unclear',
+                'reissue_notice': "응답을 이해하지 못했습니다. '승인' 또는 '거절'이라고 말씀해 주세요.",
+            }
+        if result.action == 'reject':
+            return reissue_end(REISSUE_CANCEL_TEXT)
+        return {'reissue_response': None, 'reissue_decision': 'approve'}
+
+    return reissue_interpret
+
+
+reissue_interpret = make_reissue_interpret()
+
+
+def reissue_execute(state: BankState) -> BankState:
+    """승인된 처리를 다시 검증한 뒤 저장하는 노드"""
+
+    if state.get('reissue_decision') != 'approve':
+        return reissue_end('승인이 확인되지 않아 처리하지 않았습니다.')
+
+    action = state['reissue_action']
+    owner_id = state['owner_id']
+    data = load_data()
+
+    if action.kind == 'create':
+        reason = validate_reissue_create(data, owner_id, action.card_id, action.delivery_address_id)
+    elif action.kind == 'edit':
+        reason = validate_reissue_edit(data, owner_id, action.reissue_id, action.delivery_address_id)
+    else:
+        reason = validate_reissue_cancel(data, owner_id, action.reissue_id)
+    if reason:
+        return reissue_end(f'승인 이후 다시 확인해 보니 처리할 수 없습니다. {reason}')
+
+    try:
+        if action.kind == 'create':
+            new_data, record = apply_reissue_create(data, owner_id, action.card_id, action.delivery_address_id)
+            text = f"재발급을 신청했습니다. 신청 번호: {record['reissue_id']}"
+        elif action.kind == 'edit':
+            new_data, record = apply_reissue_edit(data, owner_id, action.reissue_id, action.delivery_address_id)
+            text = f"신청({record['reissue_id']})의 배송지를 바꿨습니다."
+        else:
+            new_data, record = apply_reissue_cancel(data, owner_id, action.reissue_id)
+            text = f"신청({record['reissue_id']})을 취소했습니다."
+        save_data(new_data)
+    except Exception:
+        return reissue_end('저장 중 오류가 발생해 처리되지 않았습니다.')
+
+    return reissue_end(text)
+
+
+def reissue_continues(state: BankState) -> str:
+    return 'continue' if state.get('reissue_action') is not None else END
+
+
+def reissue_after_interpret(state: BankState) -> str:
+    if state.get('reissue_action') is None:
+        return END
+    return 'execute' if state.get('reissue_decision') == 'approve' else 'again'
+
+
+def build_reissue_graph(extract=reissue_extract, classifier=classify_reissue_response):
+    builder = StateGraph(BankState)
+    builder.add_node("reissue_extract", extract)
+    builder.add_node("reissue_validate", reissue_validate)
+    builder.add_node("reissue_approve", reissue_approve)
+    builder.add_node("reissue_interpret", make_reissue_interpret(classifier))
+    builder.add_node("reissue_execute", reissue_execute)
+
+    builder.add_edge(START, "reissue_extract")
+    builder.add_conditional_edges("reissue_extract", reissue_continues, {"continue": "reissue_validate", END: END})
+    builder.add_conditional_edges("reissue_validate", reissue_continues, {"continue": "reissue_approve", END: END})
+    builder.add_edge("reissue_approve", "reissue_interpret")
+    builder.add_conditional_edges(
+        "reissue_interpret", reissue_after_interpret,
+        {"execute": "reissue_execute", "again": "reissue_approve", END: END},
+    )
+    builder.add_edge("reissue_execute", END)
+    return builder.compile()
+
+
+reissue_graph = build_reissue_graph()
+
+
+# ---------- card_lost_and_reissue_agent (분실 정지 → 재발급, 한 요청에서 순차 처리) ----------
+
+class LRCardDraft(BaseModel):
+    card_id: str | None = Field(default=None, description="분실 정지·재발급 대상 카드의 card_id. 특정할 수 없으면 null")
+
+
+lr_card_extract_llm = llm.with_structured_output(LRCardDraft)
+
+
+class LRAddressDraft(BaseModel):
+    delivery_address_id: str | None = Field(default=None, description="재발급 배송지의 address_id. 특정할 수 없으면 null")
+
+
+lr_address_extract_llm = llm.with_structured_output(LRAddressDraft)
+
+
+def lr_identify(state: BankState) -> BankState:
+    """정지+재발급 흐름의 시작: 대상 카드를 확인한다. 이미 분실 정지된 카드인지는 이후 조건부 분기가 판단한다"""
+
+    owner_id = state['owner_id']
+    cards = get_owner_cards(load_data(), owner_id)
+    card_lines = '\n'.join(
+        f"- {c['card_id']}: {c['name']} ({CARD_STATUS_LABELS.get(c['status'], c['status'])})" for c in cards
+    )
+    system = SystemMessage(
+        content=(
+            "당신은 카드 분실 정지 후 재발급 요청에서 대상 카드를 추출합니다. "
+            f"사용자의 카드 목록(괄호 안은 상태):\n{card_lines}\n"
+            "카드 이름으로 말하면 위 목록에서 해당 card_id로 바꾸세요. card_id를 직접 말했다면 목록에 없더라도 그대로 반환하세요. "
+            "일치하는 카드가 2개 이상이면 특정할 수 없으므로 null로 두세요."
+        )
+    )
+    draft = lr_card_extract_llm.invoke([system, *state['messages']]) or LRCardDraft()
+    if draft.card_id is None:
+        names = ', '.join(c['name'] for c in cards)
+        text = f"정지하고 재발급받을 카드를 알려주세요. (보유 카드: {names})"
+        return {'messages': [AIMessage(content=text)], 'pending_reissue_card_id': None}
+    return {'pending_reissue_card_id': draft.card_id}
+
+
+def lr_route_after_identify(state: BankState) -> str:
+    card_id = state.get('pending_reissue_card_id')
+    if not card_id:
+        return END
+    data = load_data()
+    card = next((c for c in data['cards'] if c['card_id'] == card_id), None)
+    if card is not None and card['status'] == 'lost':
+        return 'reissue'
+    return 'lost'
+
+
+def lr_set_lost_action(state: BankState) -> BankState:
+    """lost_phase 서브그래프의 extract 자리를 대신한다: 이미 확인한 카드로 바로 분실 정지 처리안을 만든다"""
+    return {**CARD_STATUS_RESET, 'card_status_action': CardStatusAction(card_id=state['pending_reissue_card_id'], kind='lost')}
+
+
+def lr_after_lost(state: BankState) -> str:
+    """분실 정지가 실제로 반영됐을 때만 재발급 단계로 넘어간다(거절·실패 시 넘어가지 않는다)"""
+    card_id = state.get('pending_reissue_card_id')
+    if not card_id:
+        return END
+    data = load_data()
+    card = next((c for c in data['cards'] if c['card_id'] == card_id), None)
+    if card is not None and card['status'] == 'lost':
+        return 'reissue'
+    return END
+
+
+def lr_reissue_extract(state: BankState) -> BankState:
+    """reissue_phase 서브그래프의 extract 자리를 대신한다: 카드는 이미 정해져 있으므로 배송지만 뽑는다"""
+
+    card_id = state['pending_reissue_card_id']
+    owner_id = state['owner_id']
+    addresses = get_owner_addresses(load_data(), owner_id)
+    address_lines = '\n'.join(f"- {a['address_id']}: {a['label']}" for a in addresses)
+    system = SystemMessage(
+        content=(
+            "당신은 카드 재발급 신청의 배송지를 추출합니다. "
+            f"사용자의 등록된 배송지 목록:\n{address_lines}\n"
+            "배송지 이름으로 말하면 위 목록에서 해당 address_id로 바꾸세요. "
+            "특정할 수 없거나 말하지 않았으면 null로 두세요."
+        )
+    )
+    # 정지 단계가 끝난 직후라 마지막 메시지가 AI의 완료 안내일 수 있다(모델이 마지막 turn에
+    # user/함수 응답을 요구하므로 그대로 넘기면 오류가 난다). 사용자가 실제로 말한 내용만 추린다.
+    human_messages = [m for m in state['messages'] if isinstance(m, HumanMessage)]
+    draft = lr_address_extract_llm.invoke([system, *human_messages]) or LRAddressDraft()
+    if draft.delivery_address_id is None:
+        addr_names = ', '.join(a['label'] for a in addresses)
+        return reissue_end(f"재발급 배송지를 알려주세요. (등록된 배송지: {addr_names})")
+    return {**REISSUE_RESET, 'reissue_action': ReissueAction(
+        kind='create', card_id=card_id, delivery_address_id=draft.delivery_address_id,
+    )}
+
+
+def build_card_lost_and_reissue_graph(
+    identify=lr_identify, lost_extract=lr_set_lost_action, reissue_extract_fn=lr_reissue_extract,
+    lost_classifier=classify_card_status_response, reissue_classifier=classify_reissue_response,
+):
+    builder = StateGraph(BankState)
+    builder.add_node("lr_identify", identify)
+    builder.add_node("lost_phase", build_card_status_graph(extract=lost_extract, classifier=lost_classifier))
+    builder.add_node("reissue_phase", build_reissue_graph(extract=reissue_extract_fn, classifier=reissue_classifier))
+
+    builder.add_edge(START, "lr_identify")
+    builder.add_conditional_edges(
+        "lr_identify", lr_route_after_identify, {"lost": "lost_phase", "reissue": "reissue_phase", END: END}
+    )
+    builder.add_conditional_edges("lost_phase", lr_after_lost, {"reissue": "reissue_phase", END: END})
+    builder.add_edge("reissue_phase", END)
+    return builder.compile()
+
+
+card_lost_and_reissue_graph = build_card_lost_and_reissue_graph()
+
+
 UNSUPPORTED_TEXT = (
     '죄송합니다. 해당 요청은 아직 지원하지 않습니다. '
-    '현재는 계좌·잔액 조회, 거래내역 조회, 내 계좌 간 이체, 계좌 별명 변경만 도와드릴 수 있습니다.'
+    '현재는 계좌·잔액 조회, 거래내역 조회, 내 계좌 간 이체, 계좌 별명 변경, '
+    '카드 조회·분실 정지·일시 잠금·잠금 해제·재발급만 도와드릴 수 있습니다.'
 )
 
 
@@ -814,6 +1495,10 @@ parent_builder.add_node("supervisor", supervisor)
 parent_builder.add_node("account_agent", account_graph)
 parent_builder.add_node("transfer_agent", transfer_graph)
 parent_builder.add_node("nickname_agent", nickname_graph)
+parent_builder.add_node("card_agent", card_graph)
+parent_builder.add_node("card_status_agent", card_status_graph)
+parent_builder.add_node("reissue_agent", reissue_graph)
+parent_builder.add_node("card_lost_and_reissue_agent", card_lost_and_reissue_graph)
 parent_builder.add_node("unsupported", unsupported_reply)
 
 parent_builder.add_edge(START, "supervisor")
@@ -823,12 +1508,20 @@ parent_builder.add_conditional_edges(
         "account_agent": "account_agent",
         "transfer_agent": "transfer_agent",
         "nickname_agent": "nickname_agent",
+        "card_agent": "card_agent",
+        "card_status_agent": "card_status_agent",
+        "reissue_agent": "reissue_agent",
+        "card_lost_and_reissue_agent": "card_lost_and_reissue_agent",
         "unsupported": "unsupported",
     },
 )
 parent_builder.add_edge("account_agent", END)
 parent_builder.add_edge("transfer_agent", END)
 parent_builder.add_edge("nickname_agent", END)
+parent_builder.add_edge("card_agent", END)
+parent_builder.add_edge("card_status_agent", END)
+parent_builder.add_edge("reissue_agent", END)
+parent_builder.add_edge("card_lost_and_reissue_agent", END)
 parent_builder.add_edge("unsupported", END)
 
 checkpoint_serde = JsonPlusSerializer(
@@ -837,6 +1530,8 @@ checkpoint_serde = JsonPlusSerializer(
         (TransferLeg.__module__, TransferLeg.__name__),
         (SplitTransfer.__module__, SplitTransfer.__name__),
         (NicknameChange.__module__, NicknameChange.__name__),
+        (CardStatusAction.__module__, CardStatusAction.__name__),
+        (ReissueAction.__module__, ReissueAction.__name__),
     ]
 )
 parent_graph = parent_builder.compile(checkpointer=InMemorySaver(serde=checkpoint_serde))

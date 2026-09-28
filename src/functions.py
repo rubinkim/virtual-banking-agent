@@ -407,3 +407,269 @@ def apply_nickname_change(data: dict, owner_id: str, account_id: str, new_nickna
     }
     new_data['requests'].append(record)
     return new_data, record
+
+
+# ---------- 카드 ----------
+
+def get_owner_cards(data: dict, owner_id: str) -> list[dict]:
+    return [c for c in data['cards'] if c['owner_id'] == owner_id]
+
+
+def get_owner_addresses(data: dict, owner_id: str) -> list[dict]:
+    return [a for a in data['addresses'] if a['owner_id'] == owner_id]
+
+
+CARD_TYPE_LABELS = {'debit': '체크카드', 'credit': '신용카드'}
+CARD_STATUS_LABELS = {'active': '사용 가능', 'locked': '일시 잠금', 'lost': '분실 정지'}
+
+
+@tool(parse_docstring=True)
+def get_cards_by_owner(owner_id: str, card_id: str | None = None) -> str:
+    """카드 이름·ID·종류(신용·체크)·상태를 조회한다.
+
+    Args:
+        owner_id: 카드 소유주의 아이디
+        card_id: 조회할 카드 번호. 생략하면 (None) 해당 owner_id의 모든 카드를 조회한다.
+    """
+    data = load_data()
+    matched = [
+        c for c in data['cards']
+        if c['owner_id'] == owner_id and (card_id is None or c['card_id'] == card_id)
+    ]
+    if not matched:
+        return json.dumps({'found': False, 'cards': []}, ensure_ascii=False)
+
+    return json.dumps({
+        'found': True,
+        'cards': [
+            {
+                'card_id': c['card_id'],
+                'name': c['name'],
+                'card_type': CARD_TYPE_LABELS.get(c['card_type'], c['card_type']),
+                'status': CARD_STATUS_LABELS.get(c['status'], c['status']),
+            }
+            for c in matched
+        ],
+    }, ensure_ascii=False)
+
+
+def find_open_reissue(data: dict, owner_id: str, card_id: str) -> dict | None:
+    """해당 카드의 취소되지 않은 재발급 신청을 찾는다(있으면 하나만 존재해야 한다)."""
+    for r in data['reissue_applications']:
+        if r['owner_id'] == owner_id and r['card_id'] == card_id and r['status'] != 'cancelled':
+            return r
+    return None
+
+
+REISSUE_STATUS_LABELS = {'received': '접수', 'in_production': '제작 중', 'shipping': '배송 중', 'cancelled': '취소됨'}
+
+
+@tool(parse_docstring=True)
+def get_reissue_applications_by_owner(
+    owner_id: str, card_id: str | None = None, reissue_id: str | None = None
+) -> str:
+    """카드 재발급 신청 내역에서 배송지와 처리 상태를 조회한다.
+
+    Args:
+        owner_id: 신청자의 아이디
+        card_id: 조회할 카드 번호. 생략하면 해당 owner_id의 모든 신청을 조회한다.
+        reissue_id: 조회할 신청 번호를 알고 있으면 지정한다. 생략 가능.
+    """
+    data = load_data()
+    addresses = {a['address_id']: a for a in data['addresses']}
+    matched = [
+        r for r in data['reissue_applications']
+        if r['owner_id'] == owner_id
+        and (card_id is None or r['card_id'] == card_id)
+        and (reissue_id is None or r['reissue_id'] == reissue_id)
+    ]
+    if not matched:
+        return json.dumps({'found': False, 'applications': []}, ensure_ascii=False)
+
+    return json.dumps({
+        'found': True,
+        'applications': [
+            {
+                'reissue_id': r['reissue_id'],
+                'card_id': r['card_id'],
+                'delivery_address': addresses.get(r['delivery_address_id'], {}).get('label'),
+                'status': REISSUE_STATUS_LABELS.get(r['status'], r['status']),
+                'created_at': r['created_at'],
+            }
+            for r in matched
+        ],
+    }, ensure_ascii=False)
+
+
+CARD_STATUS_CHANGE_RESULT = {'lost': 'lost', 'lock': 'locked', 'unlock': 'active'}
+
+
+def validate_card_status_change(data: dict, owner_id: str, card_id: str, kind: str) -> str | None:
+    """카드 상태를 바꿀 수 없으면 그 이유를, 가능하면 None을 반환한다. kind는 'lost'/'lock'/'unlock'."""
+    mine = {c['card_id']: c for c in get_owner_cards(data, owner_id)}
+    if card_id not in mine:
+        return '본인 소유의 카드만 처리할 수 있습니다.'
+
+    status = mine[card_id]['status']
+    if kind == 'lost':
+        if status == 'lost':
+            return '이미 분실 정지된 카드입니다.'
+    elif kind == 'lock':
+        if status != 'active':
+            return f"{CARD_STATUS_LABELS.get(status, status)} 상태인 카드는 일시 잠금할 수 없습니다. 사용 가능한 카드만 잠글 수 있습니다."
+    elif kind == 'unlock':
+        if status != 'locked':
+            return f"{CARD_STATUS_LABELS.get(status, status)} 상태인 카드는 잠금 해제할 수 없습니다. 일시 잠금된 카드만 해제할 수 있습니다."
+    else:
+        return '알 수 없는 처리입니다.'
+    return None
+
+
+def build_card_status_preview(data: dict, owner_id: str, card_id: str, kind: str) -> dict:
+    mine = {c['card_id']: c for c in get_owner_cards(data, owner_id)}
+    card = mine[card_id]
+    new_status = CARD_STATUS_CHANGE_RESULT[kind]
+    return {
+        'card_id': card_id,
+        'name': card['name'],
+        'old_status': CARD_STATUS_LABELS.get(card['status'], card['status']),
+        'new_status': CARD_STATUS_LABELS.get(new_status, new_status),
+    }
+
+
+def apply_card_status_change(data: dict, owner_id: str, card_id: str, kind: str) -> tuple[dict, dict]:
+    """원본을 바꾸지 않고, 카드 상태가 바뀐 새 데이터와 처리 기록을 반환한다."""
+    new_data = copy.deepcopy(data)
+    cards = {c['card_id']: c for c in new_data['cards']}
+    old_status = cards[card_id]['status']
+    new_status = CARD_STATUS_CHANGE_RESULT[kind]
+    cards[card_id]['status'] = new_status
+
+    request_id = f"req-{len(new_data['requests']) + 1:03d}"
+    stamp = get_transfer_time().isoformat(timespec='seconds')
+    record = {
+        'request_id': request_id,
+        'type': 'card_status_change',
+        'owner_id': owner_id,
+        'card_id': card_id,
+        'old_status': old_status,
+        'new_status': new_status,
+        'status': 'completed',
+        'created_at': stamp,
+    }
+    new_data['requests'].append(record)
+    return new_data, record
+
+
+def validate_reissue_create(data: dict, owner_id: str, card_id: str, delivery_address_id: str) -> str | None:
+    """재발급을 신청할 수 없으면 그 이유를, 가능하면 None을 반환한다."""
+    mine_cards = {c['card_id']: c for c in get_owner_cards(data, owner_id)}
+    if card_id not in mine_cards:
+        return '본인 소유의 카드만 재발급을 신청할 수 있습니다.'
+    if mine_cards[card_id]['status'] != 'lost':
+        return '분실 정지된 카드만 재발급을 신청할 수 있습니다.'
+
+    mine_addresses = {a['address_id'] for a in get_owner_addresses(data, owner_id)}
+    if delivery_address_id not in mine_addresses:
+        return '등록된 배송지 중에서만 선택할 수 있습니다.'
+
+    existing = find_open_reissue(data, owner_id, card_id)
+    if existing:
+        return (
+            f"이미 취소되지 않은 재발급 신청({existing['reissue_id']}, "
+            f"{REISSUE_STATUS_LABELS.get(existing['status'], existing['status'])})이 있습니다."
+        )
+    return None
+
+
+def build_reissue_create_preview(data: dict, owner_id: str, card_id: str, delivery_address_id: str) -> dict:
+    mine_cards = {c['card_id']: c for c in get_owner_cards(data, owner_id)}
+    addresses = {a['address_id']: a for a in data['addresses']}
+    card = mine_cards[card_id]
+    address = addresses[delivery_address_id]
+    return {
+        'card_id': card_id,
+        'card_name': card['name'],
+        'address_label': address['label'],
+        'address': address['address'],
+    }
+
+
+def apply_reissue_create(data: dict, owner_id: str, card_id: str, delivery_address_id: str) -> tuple[dict, dict]:
+    """원본을 바꾸지 않고, 재발급 신청이 추가된 새 데이터와 신청 기록을 반환한다."""
+    new_data = copy.deepcopy(data)
+    reissue_id = f"reissue-{len(new_data['reissue_applications']) + 1:03d}"
+    stamp = get_transfer_time().isoformat(timespec='seconds')
+    record = {
+        'reissue_id': reissue_id,
+        'card_id': card_id,
+        'owner_id': owner_id,
+        'delivery_address_id': delivery_address_id,
+        'status': 'received',
+        'created_at': stamp,
+    }
+    new_data['reissue_applications'].append(record)
+    return new_data, record
+
+
+def get_owner_reissue(data: dict, owner_id: str, reissue_id: str) -> dict | None:
+    return next(
+        (r for r in data['reissue_applications'] if r['owner_id'] == owner_id and r['reissue_id'] == reissue_id),
+        None,
+    )
+
+
+def validate_reissue_edit(data: dict, owner_id: str, reissue_id: str, new_address_id: str) -> str | None:
+    """재발급 신청의 배송지를 바꿀 수 없으면 그 이유를, 가능하면 None을 반환한다."""
+    application = get_owner_reissue(data, owner_id, reissue_id)
+    if application is None:
+        return '본인 명의의 해당 재발급 신청을 찾을 수 없습니다.'
+    if application['status'] != 'received':
+        return f"이미 {REISSUE_STATUS_LABELS.get(application['status'], application['status'])} 상태라 배송지를 바꿀 수 없습니다. 제작이 시작되기 전까지만 변경할 수 있습니다."
+
+    mine_addresses = {a['address_id'] for a in get_owner_addresses(data, owner_id)}
+    if new_address_id not in mine_addresses:
+        return '등록된 배송지 중에서만 선택할 수 있습니다.'
+    if new_address_id == application['delivery_address_id']:
+        return '이미 같은 배송지입니다.'
+    return None
+
+
+def validate_reissue_cancel(data: dict, owner_id: str, reissue_id: str) -> str | None:
+    """재발급 신청을 취소할 수 없으면 그 이유를, 가능하면 None을 반환한다."""
+    application = get_owner_reissue(data, owner_id, reissue_id)
+    if application is None:
+        return '본인 명의의 해당 재발급 신청을 찾을 수 없습니다.'
+    if application['status'] != 'received':
+        return f"이미 {REISSUE_STATUS_LABELS.get(application['status'], application['status'])} 상태라 취소할 수 없습니다. 제작이 시작되기 전까지만 취소할 수 있습니다."
+    return None
+
+
+def build_reissue_manage_preview(data: dict, owner_id: str, reissue_id: str, new_address_id: str | None = None) -> dict:
+    application = get_owner_reissue(data, owner_id, reissue_id)
+    addresses = {a['address_id']: a for a in data['addresses']}
+    cards = {c['card_id']: c for c in data['cards']}
+    preview = {
+        'reissue_id': reissue_id,
+        'card_name': cards[application['card_id']]['name'],
+        'current_address': addresses[application['delivery_address_id']]['label'],
+    }
+    if new_address_id is not None:
+        preview['new_address'] = addresses[new_address_id]['label']
+    return preview
+
+
+def apply_reissue_edit(data: dict, owner_id: str, reissue_id: str, new_address_id: str) -> tuple[dict, dict]:
+    """원본을 바꾸지 않고, 배송지가 바뀐 새 데이터와 신청 기록을 반환한다."""
+    new_data = copy.deepcopy(data)
+    application = next(r for r in new_data['reissue_applications'] if r['reissue_id'] == reissue_id)
+    application['delivery_address_id'] = new_address_id
+    return new_data, application
+
+
+def apply_reissue_cancel(data: dict, owner_id: str, reissue_id: str) -> tuple[dict, dict]:
+    """원본을 바꾸지 않고, 신청이 취소 처리된 새 데이터와 신청 기록을 반환한다."""
+    new_data = copy.deepcopy(data)
+    application = next(r for r in new_data['reissue_applications'] if r['reissue_id'] == reissue_id)
+    application['status'] = 'cancelled'
+    return new_data, application
